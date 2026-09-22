@@ -1,0 +1,2011 @@
+From: Nilanka de Silva <nilankadsilva@gmail.com>
+Subject: net: mediatek: PPE HQoS subset of the MediaTek vendor series, ported to 6.18
+Adds mtk_eth_qos_debugfs.c: /sys/kernel/debug/mtketh/qdma_sch<N>, qdma_txq<N> (vendor-compatible formats) so the
+qos_toggle HQoS mode has a shaper/scheduler configuration interface without the SDK mtk_hnat driver.
+--- a/drivers/net/ethernet/mediatek/Makefile
++++ b/drivers/net/ethernet/mediatek/Makefile
+@@ -4,7 +4,7 @@
+ #
+ 
+ obj-$(CONFIG_NET_MEDIATEK_SOC) += mtk_eth.o
+-mtk_eth-y := mtk_eth_soc.o mtk_eth_path.o mtk_ppe.o mtk_ppe_debugfs.o mtk_ppe_offload.o
++mtk_eth-y := mtk_eth_soc.o mtk_eth_path.o mtk_ppe.o mtk_ppe_debugfs.o mtk_ppe_offload.o mtk_eth_qos_debugfs.o
+ mtk_eth-$(CONFIG_NET_MEDIATEK_SOC_WED) += mtk_wed.o mtk_wed_mcu.o mtk_wed_wo.o
+ ifdef CONFIG_DEBUG_FS
+ mtk_eth-$(CONFIG_NET_MEDIATEK_SOC_WED) += mtk_wed_debugfs.o
+--- /dev/null
++++ b/drivers/net/ethernet/mediatek/mtk_eth_qos_debugfs.c
+@@ -0,0 +1,283 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Minimal QDMA scheduler / per-queue shaper configuration for MediaTek NETSYS,
++ * file-compatible with the MediaTek SDK "mtketh" debugfs that the PPE HQoS
++ * mode expects (/sys/kernel/debug/mtketh/qdma_sch<N>, qdma_txq<N>).
++ *
++ *   qdma_sch<N>: write "<enable> <sp|wrr> <rate_kbps>"
++ *   qdma_txq<N>: write "<scheduler> <min_en> <min_kbps> <max_en> <max_kbps> <weight> <resv>"
++ * Register recipe follows mtk_set_queue_speed() and the vendor mtk_eth_dbg.c.
++ */
++#include <linux/debugfs.h>
++#include <linux/uaccess.h>
++#include <linux/bitfield.h>
++#include "mtk_eth_soc.h"
++
++static struct dentry *mtk_qos_root;
++
++/* Per-file context. debugfs owns dentry->d_fsdata (it lazily stores its own
++ * struct debugfs_fsdata there), so the scheduler / queue index travels in
++ * inode->i_private instead.
++ */
++struct mtk_qos_file {
++	struct mtk_eth *eth;
++	int id;
++};
++
++static ssize_t qos_ul_dev_read(struct file *file, char __user *ubuf, size_t count, loff_t *ppos)
++{
++	struct mtk_eth *eth = file_inode(file)->i_private;
++	struct net_device *dev = NULL;
++	char buf[IFNAMSIZ + 2];
++	int len;
++
++	if (eth->qos_ul_ifindex)
++		dev = dev_get_by_index(&init_net, eth->qos_ul_ifindex);
++	len = scnprintf(buf, sizeof(buf), "%s\n", dev ? dev->name : "none");
++	dev_put(dev);
++	return simple_read_from_buffer(ubuf, count, ppos, buf, len);
++}
++
++static ssize_t qos_ul_dev_write(struct file *file, const char __user *ubuf, size_t count, loff_t *ppos)
++{
++	struct mtk_eth *eth = file_inode(file)->i_private;
++	struct net_device *dev;
++	char name[IFNAMSIZ + 1] = {};
++
++	if (count >= sizeof(name))
++		return -EINVAL;
++	if (copy_from_user(name, ubuf, count))
++		return -EFAULT;
++	strim(name);
++	if (!name[0] || !strcmp(name, "none")) {
++		eth->qos_ul_ifindex = 0;
++		return count;
++	}
++	dev = dev_get_by_name(&init_net, name);
++	if (!dev)
++		return -ENODEV;
++	eth->qos_ul_ifindex = dev->ifindex;
++	dev_put(dev);
++	return count;
++}
++
++static const struct file_operations qos_ul_dev_fops = {
++	.open = simple_open, .read = qos_ul_dev_read, .write = qos_ul_dev_write, .llseek = default_llseek,
++};
++
++static void mtk_qos_rate_to_man_exp(int rate, int *man, int *exp)
++{
++	*exp = 0;
++	while (rate > 127) {
++		rate /= 10;
++		(*exp)++;
++	}
++	*man = rate;
++}
++
++static ssize_t qdma_sch_read(struct file *file, char __user *ubuf, size_t count, loff_t *ppos)
++{
++	struct mtk_qos_file *qf = file_inode(file)->i_private;
++	struct mtk_eth *eth = qf->eth;
++	long id = qf->id;
++	const struct mtk_soc_data *soc = eth->soc;
++	char buf[96];
++	u32 v, sch;
++	int en, wfq, man, exp, len;
++
++	if (mtk_is_netsys_v2_or_greater(eth))
++		v = mtk_r32(eth, soc->reg_map->qdma.tx_sch_rate + (id >> 1) * 0x4);
++	else
++		v = mtk_r32(eth, soc->reg_map->qdma.tx_sch_rate);
++	sch = (id & 1) ? (v >> 16) : v;
++	sch &= MTK_QDMA_TX_SCH;
++	en  = FIELD_GET(MTK_QDMA_TX_SCH_RATE_EN, sch);
++	wfq = FIELD_GET(MTK_QDMA_TX_SCH_MAX_WFQ, sch);
++	man = FIELD_GET(MTK_QDMA_TX_SCH_RATE_MAN, sch);
++	exp = FIELD_GET(MTK_QDMA_TX_SCH_RATE_EXP, sch);
++	while (exp-- > 0)
++		man *= 10;
++	len = scnprintf(buf, sizeof(buf), "sch%ld: enable=%d mode=%s rate=%d kbps\n",
++			id, en, wfq ? "wrr" : "sp", man);
++	return simple_read_from_buffer(ubuf, count, ppos, buf, len);
++}
++
++static ssize_t qdma_sch_write(struct file *file, const char __user *ubuf, size_t count, loff_t *ppos)
++{
++	struct mtk_qos_file *qf = file_inode(file)->i_private;
++	struct mtk_eth *eth = qf->eth;
++	long id = qf->id;
++	const struct mtk_soc_data *soc = eth->soc;
++	char line[64] = {}, mode[8] = {};
++	int enable, rate, man, exp, shift = (id & 1) ? 16 : 0;
++	u32 val = 0, reg, v;
++
++	if (count >= sizeof(line))
++		return -EINVAL;
++	if (copy_from_user(line, ubuf, count))
++		return -EFAULT;
++	if (sscanf(line, "%d %7s %d", &enable, mode, &rate) != 3)
++		return -EINVAL;
++	if (rate < 0 || rate > (mtk_is_netsys_v3_or_greater(eth) ? 10000000 : 1000000))
++		return -EINVAL;
++	mtk_qos_rate_to_man_exp(rate, &man, &exp);
++	if (enable)
++		val |= MTK_QDMA_TX_SCH_RATE_EN;
++	if (strcmp(mode, "sp") != 0)
++		val |= MTK_QDMA_TX_SCH_MAX_WFQ;
++	val |= FIELD_PREP(MTK_QDMA_TX_SCH_RATE_MAN, man) |
++	       FIELD_PREP(MTK_QDMA_TX_SCH_RATE_EXP, exp);
++
++	reg = soc->reg_map->qdma.tx_sch_rate;
++	if (mtk_is_netsys_v2_or_greater(eth))
++		reg += (id >> 1) * 0x4;
++	spin_lock_bh(&eth->page_lock);
++	v = mtk_r32(eth, reg);
++	v &= ~(MTK_QDMA_TX_SCH << shift);
++	v |= val << shift;
++	mtk_w32(eth, v, reg);
++	spin_unlock_bh(&eth->page_lock);
++	return count;
++}
++
++static ssize_t qdma_txq_read(struct file *file, char __user *ubuf, size_t count, loff_t *ppos)
++{
++	struct mtk_qos_file *qf = file_inode(file)->i_private;
++	struct mtk_eth *eth = qf->eth;
++	long id = qf->id;
++	const struct mtk_soc_data *soc = eth->soc;
++	bool v3 = mtk_is_netsys_v3_or_greater(eth) && eth->soc->caps != MT7988_CAPS;
++	char buf[160];
++	u32 sch, cfg, ofs = MTK_QTX_OFFSET * (id % MTK_QTX_PER_PAGE);
++	int min_en, min_man, min_exp, max_en, max_man, max_exp, weight, scheduler, len;
++
++	spin_lock_bh(&eth->page_lock);
++	mtk_w32(eth, id / MTK_QTX_PER_PAGE, soc->reg_map->qdma.page);
++	sch = mtk_r32(eth, soc->reg_map->qdma.qtx_sch + ofs);
++	cfg = mtk_r32(eth, soc->reg_map->qdma.qtx_cfg + ofs);
++	spin_unlock_bh(&eth->page_lock);
++
++	scheduler = mtk_is_netsys_v2_or_greater(eth) ? FIELD_GET(MTK_QTX_SCH_TX_SEL_V2, sch)
++						     : FIELD_GET(MTK_QTX_SCH_TX_SEL, sch);
++	min_en = FIELD_GET(MTK_QTX_SCH_MIN_RATE_EN, sch);
++	if (v3) {
++		min_man = FIELD_GET(MTK_QTX_SCH_MIN_RATE_MAN_V3, sch); min_exp = FIELD_GET(MTK_QTX_SCH_MIN_RATE_EXP_V3, sch);
++		max_en = FIELD_GET(MTK_QTX_SCH_MAX_RATE_EN_V3, sch);
++		max_man = FIELD_GET(MTK_QTX_SCH_MAX_RATE_MAN_V3, sch); max_exp = FIELD_GET(MTK_QTX_SCH_MAX_RATE_EXP_V3, sch);
++		weight = FIELD_GET(MTK_QTX_SCH_MAX_RATE_WEIGHT_V3, sch);
++	} else {
++		min_man = FIELD_GET(MTK_QTX_SCH_MIN_RATE_MAN, sch); min_exp = FIELD_GET(MTK_QTX_SCH_MIN_RATE_EXP, sch);
++		max_en = FIELD_GET(MTK_QTX_SCH_MAX_RATE_EN, sch);
++		max_man = FIELD_GET(MTK_QTX_SCH_MAX_RATE_MAN, sch); max_exp = FIELD_GET(MTK_QTX_SCH_MAX_RATE_EXP, sch);
++		weight = FIELD_GET(MTK_QTX_SCH_MAX_RATE_WEIGHT, sch);
++	}
++	while (min_exp-- > 0) min_man *= 10;
++	while (max_exp-- > 0) max_man *= 10;
++	len = scnprintf(buf, sizeof(buf),
++			"txq%ld: scheduler=%d min_en=%d min=%d kbps max_en=%d max=%d kbps weight=%d hw_resv=%lu sw_resv=%lu\n",
++			id, scheduler, min_en, min_man, max_en, max_man, weight,
++			(unsigned long)FIELD_GET(MTK_QTX_CFG_HW_RESV, cfg),
++			(unsigned long)FIELD_GET(MTK_QTX_CFG_SW_RESV, cfg));
++	return simple_read_from_buffer(ubuf, count, ppos, buf, len);
++}
++
++static ssize_t qdma_txq_write(struct file *file, const char __user *ubuf, size_t count, loff_t *ppos)
++{
++	struct mtk_qos_file *qf = file_inode(file)->i_private;
++	struct mtk_eth *eth = qf->eth;
++	long id = qf->id;
++	const struct mtk_soc_data *soc = eth->soc;
++	bool v3 = mtk_is_netsys_v3_or_greater(eth) && eth->soc->caps != MT7988_CAPS;
++	char line[64] = {};
++	int scheduler, min_en, min_rate, max_en, max_rate, weight, resv;
++	int min_man, min_exp, max_man, max_exp, limit;
++	u32 sch = 0, cfg, ofs = MTK_QTX_OFFSET * (id % MTK_QTX_PER_PAGE);
++
++	if (count >= sizeof(line))
++		return -EINVAL;
++	if (copy_from_user(line, ubuf, count))
++		return -EFAULT;
++	if (sscanf(line, "%d %d %d %d %d %d %d", &scheduler, &min_en, &min_rate,
++		   &max_en, &max_rate, &weight, &resv) != 7)
++		return -EINVAL;
++	limit = mtk_is_netsys_v3_or_greater(eth) ? 10000000 : 1000000;
++	if (min_rate < 0 || min_rate > limit || max_rate < 0 || max_rate > limit ||
++	    scheduler < 0 || scheduler > 3 || weight < 0 || resv < 0 || resv > 255)
++		return -EINVAL;
++	mtk_qos_rate_to_man_exp(min_rate, &min_man, &min_exp);
++	mtk_qos_rate_to_man_exp(max_rate, &max_man, &max_exp);
++
++	if (mtk_is_netsys_v2_or_greater(eth))
++		sch |= FIELD_PREP(MTK_QTX_SCH_TX_SEL_V2, scheduler);
++	else
++		sch |= FIELD_PREP(MTK_QTX_SCH_TX_SEL, scheduler);
++	sch |= FIELD_PREP(MTK_QTX_SCH_LEAKY_BUCKET_SIZE, 3);
++	if (min_en)
++		sch |= MTK_QTX_SCH_MIN_RATE_EN;
++	if (v3) {
++		sch |= FIELD_PREP(MTK_QTX_SCH_MIN_RATE_MAN_V3, min_man) | FIELD_PREP(MTK_QTX_SCH_MIN_RATE_EXP_V3, min_exp);
++		if (max_en)
++			sch |= MTK_QTX_SCH_MAX_RATE_EN_V3;
++		sch |= FIELD_PREP(MTK_QTX_SCH_MAX_RATE_WEIGHT_V3, weight) |
++		       FIELD_PREP(MTK_QTX_SCH_MAX_RATE_MAN_V3, max_man) | FIELD_PREP(MTK_QTX_SCH_MAX_RATE_EXP_V3, max_exp);
++	} else {
++		sch |= FIELD_PREP(MTK_QTX_SCH_MIN_RATE_MAN, min_man) | FIELD_PREP(MTK_QTX_SCH_MIN_RATE_EXP, min_exp);
++		if (max_en)
++			sch |= MTK_QTX_SCH_MAX_RATE_EN;
++		sch |= FIELD_PREP(MTK_QTX_SCH_MAX_RATE_WEIGHT, weight) |
++		       FIELD_PREP(MTK_QTX_SCH_MAX_RATE_MAN, max_man) | FIELD_PREP(MTK_QTX_SCH_MAX_RATE_EXP, max_exp);
++	}
++
++	spin_lock_bh(&eth->page_lock);
++	mtk_w32(eth, id / MTK_QTX_PER_PAGE, soc->reg_map->qdma.page);
++	mtk_w32(eth, sch, soc->reg_map->qdma.qtx_sch + ofs);
++	cfg = mtk_r32(eth, soc->reg_map->qdma.qtx_cfg + ofs);
++	cfg &= ~(MTK_QTX_CFG_HW_RESV | MTK_QTX_CFG_SW_RESV);
++	cfg |= FIELD_PREP(MTK_QTX_CFG_HW_RESV, resv) | FIELD_PREP(MTK_QTX_CFG_SW_RESV, resv);
++	mtk_w32(eth, cfg, soc->reg_map->qdma.qtx_cfg + ofs);
++	spin_unlock_bh(&eth->page_lock);
++	return count;
++}
++
++static const struct file_operations qdma_sch_fops = {
++	.open = simple_open, .read = qdma_sch_read, .write = qdma_sch_write, .llseek = default_llseek,
++};
++static const struct file_operations qdma_txq_fops = {
++	.open = simple_open, .read = qdma_txq_read, .write = qdma_txq_write, .llseek = default_llseek,
++};
++
++int mtk_eth_qos_debugfs_init(struct mtk_eth *eth)
++{
++	struct mtk_qos_file *qf;
++	char name[16];
++	int i, nq = eth->soc->num_tx_queues;
++	int ns = mtk_is_netsys_v3_or_greater(eth) ? 4 : 2;
++
++	if (mtk_qos_root)
++		return 0;
++	qf = devm_kcalloc(eth->dev, ns + nq, sizeof(*qf), GFP_KERNEL);
++	if (!qf)
++		return -ENOMEM;
++	mtk_qos_root = debugfs_create_dir("mtketh", NULL);
++	if (IS_ERR_OR_NULL(mtk_qos_root))
++		return -ENOMEM;
++	for (i = 0; i < ns; i++) {
++		qf[i].eth = eth;
++		qf[i].id = i;
++		snprintf(name, sizeof(name), "qdma_sch%d", i);
++		debugfs_create_file(name, 0644, mtk_qos_root, &qf[i], &qdma_sch_fops);
++	}
++	for (i = 0; i < nq; i++) {
++		qf[ns + i].eth = eth;
++		qf[ns + i].id = i;
++		snprintf(name, sizeof(name), "qdma_txq%d", i);
++		debugfs_create_file(name, 0644, mtk_qos_root, &qf[ns + i], &qdma_txq_fops);
++	}
++	debugfs_create_file("qos_ul_dev", 0644, mtk_qos_root, eth, &qos_ul_dev_fops);
++	return 0;
++}
++
++void mtk_eth_qos_debugfs_exit(void)
++{
++	debugfs_remove_recursive(mtk_qos_root);
++	mtk_qos_root = NULL;
++}
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -5135,6 +5135,18 @@ static u16 mtk_select_queue(struct net_d
+ 		queue = mac->id;
+ 	}
+ 
++	/* HQoS: CPU-transmitted packets (tunnel encapsulation, locally
++	 * generated, non-offloaded forwards) pick a class queue from the
++	 * skb mark, bits 16-20, when HQoS mode is on. Ids below 12 are the
++	 * GMAC and DSA port queues on MT7988 and are left to the layout above.
++	 */
++	if (mac->hw->qos_toggle == 1) {
++		unsigned int q = (skb->mark >> 16) & (mac->hw->soc->num_tx_queues - 1);
++
++		if (q >= 12)
++			queue = q;
++	}
++
+ 	if (queue >= dev->num_tx_queues)
+ 		queue = 0;
+ 
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.h
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.h
+@@ -34,6 +34,12 @@
+ #define MTK_DSA_USER_PORT_MAX	32
+ 
+ #define MTK_QTX_PER_PAGE	16
++/* PPE/TX descriptor transmit-port index (NETSYS v3) */
++#define TPORT_PDMA			0
++#define TPORT_QDMA			1
++#define TPORT_EIP197			2
++#define TPORT_EIP197_QDMA		3
++
+ #define MTK_QDMA_PAGE_SIZE	2048
+ #define MTK_MAX_RX_LENGTH	1536
+ #define MTK_MAX_RX_LENGTH_2K	2048
+@@ -280,6 +286,12 @@
+ 
+ /* QDMA TX Scheduler Rate Control Register */
+ #define MTK_QDMA_TX_SCH_MAX_WFQ		BIT(15)
++#define MTK_QDMA_TX_SCH			GENMASK(15, 0)
++#define MTK_QDMA_TX_SCH_RATE_EN		BIT(11)
++#define MTK_QDMA_TX_SCH_RATE_MAN	GENMASK(10, 4)
++#define MTK_QDMA_TX_SCH_RATE_EXP	GENMASK(3, 0)
++#define MTK_QTX_CFG_HW_RESV		GENMASK(15, 8)
++#define MTK_QTX_CFG_SW_RESV		GENMASK(7, 0)
+ 
+ /* QDMA Global Configuration Register */
+ #define MTK_RX_2B_OFFSET	BIT(31)
+@@ -1430,6 +1442,9 @@ struct mtk_eth {
+ 
+ 	struct metadata_dst		*dsa_meta[MTK_MAX_DSA_PORTS];
+ 
++	u8				dscp_toggle;
++	u8				qos_toggle;
++	int				qos_ul_ifindex;	/* debugfs mtketh/qos_ul_dev: egress netdev treated as uplink */
+ 	struct mtk_ppe			*ppe[3];
+ 	struct rhashtable		flow_table;
+ 
+@@ -1531,6 +1546,14 @@ static inline u32 mtk_get_ib1_ppoe_mask(
+ 	return MTK_FOE_IB1_BIND_PPPOE;
+ }
+ 
++static inline u32 mtk_get_ib1_sp_tag_mask(struct mtk_eth *eth)
++{
++	if (mtk_is_netsys_v3_or_greater(eth))
++		return MTK_FOE_IB1_BIND_IS_SP_TAG_V3;
++
++	return 0;
++}
++
+ static inline u32 mtk_get_ib1_vlan_tag_mask(struct mtk_eth *eth)
+ {
+ 	if (mtk_is_netsys_v2_or_greater(eth))
+@@ -1579,6 +1602,14 @@ static inline u32 mtk_get_ib1_pkt_type(s
+ 	return FIELD_GET(MTK_FOE_IB1_PACKET_TYPE, val);
+ }
+ 
++static inline u32 mtk_get_ib1_sp(struct mtk_eth *eth, struct mtk_foe_entry *foe)
++{
++	if (mtk_is_netsys_v2_or_greater(eth))
++		return FIELD_GET(MTK_FOE_IB1_BIND_SRC_PORT_V2, foe->ib1);
++
++	return 0;
++}
++
+ static inline u32 mtk_get_ib2_multicast_mask(struct mtk_eth *eth)
+ {
+ 	if (mtk_is_netsys_v2_or_greater(eth))
+@@ -1587,6 +1618,51 @@ static inline u32 mtk_get_ib2_multicast_
+ 	return MTK_FOE_IB2_MULTICAST;
+ }
+ 
++static inline int
++mtk_dev_link_speed(struct mtk_eth *eth, struct net_device *dev)
++{
++	size_t i;
++
++	if (!dev)
++		return SPEED_UNKNOWN;
++
++	if (dev->phydev)
++		return READ_ONCE(dev->phydev->speed);
++
++	for (i = 0; i < ARRAY_SIZE(eth->netdev); i++) {
++		if (dev == eth->netdev[i]) {
++			struct mtk_mac *mac = netdev_priv(dev);
++			return READ_ONCE(mac->speed);
++		}
++	}
++
++	return SPEED_UNKNOWN;
++}
++
++static inline int
++mtk_ppe_check_pppq_path(struct mtk_eth *eth, struct net_device *idev,
++			struct net_device *odev, int dsa_port)
++{
++	bool wifi_rx = idev && !!(idev->ieee80211_ptr);
++	int odev_speed;
++
++	if ((dsa_port >= 0 && dsa_port <= 4) ||
++	    (dsa_port == 5 && wifi_rx))
++		return 1;
++
++	odev_speed = mtk_dev_link_speed(eth, odev);
++	if (odev_speed <= 0)
++		return 0;
++
++	if (mtk_is_netsys_v3_or_greater(eth)) {
++		/* Handle cases of GMAC port linked less or equal to 1Gbps */
++		if (odev_speed <= SPEED_1000)
++			return 1;
++	}
++
++	return 0;
++}
++
+ static inline bool mtk_interface_mode_is_xgmii(struct mtk_eth *eth,
+ 					       phy_interface_t interface)
+ {
+@@ -1609,6 +1685,8 @@ void mtk_stats_update_mac(struct mtk_mac
+ 
+ void mtk_w32(struct mtk_eth *eth, u32 val, unsigned reg);
+ u32 mtk_r32(struct mtk_eth *eth, unsigned reg);
++int mtk_eth_qos_debugfs_init(struct mtk_eth *eth);
++void mtk_eth_qos_debugfs_exit(void);
+ u32 mtk_m32(struct mtk_eth *eth, u32 mask, u32 set, unsigned int reg);
+ 
+ int mtk_gmac_sgmii_path_setup(struct mtk_eth *eth, int mac_id);
+--- a/drivers/net/ethernet/mediatek/mtk_ppe.c
++++ b/drivers/net/ethernet/mediatek/mtk_ppe.c
+@@ -78,6 +78,21 @@ static int mtk_ppe_wait_busy(struct mtk_
+ 	return ret;
+ }
+ 
++static int mtk_ppe_cache_wait_busy(struct mtk_ppe *ppe)
++{
++	int ret;
++	u32 val;
++
++	ret = readl_poll_timeout_atomic(ppe->base + MTK_PPE_CACHE_CTL, val,
++					!(val & MTK_PPE_CACHE_CTL_REQ),
++					1000, MTK_PPE_WAIT_TIMEOUT_US);
++
++	if (ret)
++		dev_err(ppe->dev, "PPE cache busy");
++
++	return ret;
++}
++
+ static int mtk_ppe_mib_wait_busy(struct mtk_ppe *ppe)
+ {
+ 	int ret;
+@@ -141,15 +156,147 @@ struct mtk_foe_accounting *mtk_ppe_mib_e
+ 	return acct;
+ }
+ 
++static void mtk_ppe_cache_write(struct mtk_ppe *ppe, u32 line, u32 tag,
++				u32 state, u32 *data)
++{
++	struct mtk_eth *eth = ppe->eth;
++	int i;
++
++	if (line >= (mtk_is_netsys_v2_or_greater(eth) ? 128 : 32)) {
++		dev_warn(ppe->dev, "%s: invalid cache line in %d_%d\n",
++			 __func__, ppe->index, line);
++		return;
++	}
++
++	if (state > 3) {
++		dev_warn(ppe->dev, "%s: invalid cache line state %d in line %d_%d\n",
++			 __func__, state, ppe->index, line);
++		return;
++	}
++
++	if (data == NULL)
++		goto skip_data_write;
++
++	/* write data filed of the cache line */
++	for (i = 0; i < (eth->soc->foe_entry_size / 4); i++) {
++		ppe_m32(ppe, MTK_PPE_CACHE_RW, MTK_PPE_CACHE_RW_LINE,
++			FIELD_PREP(MTK_PPE_CACHE_RW_LINE, line));
++		if (mtk_is_netsys_v3_or_greater(eth)) {
++			ppe_m32(ppe, MTK_PPE_CACHE_RW, MTK_PPE_CACHE_RW_OFFSET,
++				FIELD_PREP(MTK_PPE_CACHE_RW_OFFSET, i / 4));
++			ppe_m32(ppe, MTK_PPE_CACHE_CTL, MTK_PPE_CACHE_CTL_DATA_SEL,
++				FIELD_PREP(MTK_PPE_CACHE_CTL_DATA_SEL, i % 4));
++		} else {
++			ppe_m32(ppe, MTK_PPE_CACHE_RW, MTK_PPE_CACHE_RW_OFFSET,
++				FIELD_PREP(MTK_PPE_CACHE_RW_OFFSET, i));
++		}
++		ppe_w32(ppe, MTK_PPE_CACHE_WDATA, data[i]);
++		/* software access cache command = write */
++		ppe_m32(ppe, MTK_PPE_CACHE_CTL, MTK_PPE_CACHE_CTL_CMD,
++			FIELD_PREP(MTK_PPE_CACHE_CTL_CMD, 3));
++		/* trigger software access cache request */
++		ppe_set(ppe, MTK_PPE_CACHE_CTL, MTK_PPE_CACHE_CTL_REQ);
++		if (mtk_ppe_cache_wait_busy(ppe))
++			dev_warn(ppe->dev, "%s: write data timeout in line %d_%d\n",
++				 __func__, ppe->index, line);
++	}
++
++skip_data_write:
++	/* write tag filed of the cache line */
++	ppe_m32(ppe, MTK_PPE_CACHE_RW, MTK_PPE_CACHE_RW_LINE,
++		FIELD_PREP(MTK_PPE_CACHE_RW_LINE, line));
++	ppe_m32(ppe, MTK_PPE_CACHE_RW, MTK_PPE_CACHE_RW_OFFSET,
++		FIELD_PREP(MTK_PPE_CACHE_RW_OFFSET, 0x1F));
++	ppe_m32(ppe, MTK_PPE_CACHE_CTL, MTK_PPE_CACHE_CTL_DATA_SEL,
++		FIELD_PREP(MTK_PPE_CACHE_CTL_DATA_SEL, 0));
++	ppe_w32(ppe, MTK_PPE_CACHE_WDATA, (state << 16) | tag);
++	/* software access cache command = write */
++	ppe_m32(ppe, MTK_PPE_CACHE_CTL, MTK_PPE_CACHE_CTL_CMD,
++		FIELD_PREP(MTK_PPE_CACHE_CTL_CMD, 3));
++	/* trigger software access cache request */
++	ppe_set(ppe, MTK_PPE_CACHE_CTL, MTK_PPE_CACHE_CTL_REQ);
++	if (mtk_ppe_cache_wait_busy(ppe)) {
++		dev_warn(ppe->dev, "%s: write tag 0x%04x timeout in line %d_%d\n",
++			 __func__, tag, ppe->index, line);
++	}
++}
++
+ static void mtk_ppe_cache_clear(struct mtk_ppe *ppe)
+ {
++	static const u32 mask = MTK_PPE_ALERT_TCP_FIN_RST_SYN |
++				MTK_PPE_MD_TOAP_BYP_CRSN0 |
++				MTK_PPE_MD_TOAP_BYP_CRSN1 |
++				MTK_PPE_MD_TOAP_BYP_CRSN2 |
++				MTK_PPE_FLOW_CFG_IP_PROTO_BLACKLIST |
++				MTK_PPE_FLOW_CFG_IP4_NAT_FRAG |
++				MTK_PPE_FLOW_CFG_IP4_HASH_GRE_KEY |
++				MTK_PPE_FLOW_CFG_IP6_HASH_GRE_KEY |
++				MTK_PPE_FLOW_CFG_CS0_RM_ALL_IP6_IP_EN |
++				MTK_PPE_FLOW_CFG_L2_HASH_ETH |
++				MTK_PPE_FLOW_CFG_L2_HASH_VID;
++	u32 cah_en, flow_cfg, scan_mode;
++	u32 i, idle, retry;
++
++	spin_lock_bh(&ppe->cache_lock);
++
++	/* disable table learning */
++	flow_cfg = ppe_r32(ppe, MTK_PPE_FLOW_CFG);
++	ppe_w32(ppe, MTK_PPE_FLOW_CFG, flow_cfg & mask);
++
++	/* wait PPE return to idle */
++	udelay(100);
++
++	for (retry = 0; retry < 10; retry++) {
++		for (i = 0, idle = 0; i < 3; i++) {
++			if ((ppe_r32(ppe, MTK_PPE_CACHE_DBG) & MTK_PPE_CACHE_DBG_BUSY) == 0)
++				idle++;
++		}
++
++		if (idle >= 3)
++			break;
++
++		udelay(10);
++	}
++
++	if (retry >= 10) {
++		pr_info("%s: ppe cache idle check timeout!\n", __func__);
++		goto out;
++	}
++
++	/* disable scan mode */
++	scan_mode = FIELD_GET(MTK_PPE_TB_CFG_SCAN_MODE, ppe_r32(ppe, MTK_PPE_TB_CFG));
++	ppe_clear(ppe, MTK_PPE_TB_CFG, MTK_PPE_TB_CFG_SCAN_MODE);
++	/* disable cache */
++	cah_en = FIELD_GET(MTK_PPE_CACHE_CTL_EN, ppe_r32(ppe, MTK_PPE_CACHE_CTL));
++	ppe_clear(ppe, MTK_PPE_CACHE_CTL, MTK_PPE_CACHE_CTL_EN);
++
++	/* invalidate PPE cache lines */
+ 	ppe_set(ppe, MTK_PPE_CACHE_CTL, MTK_PPE_CACHE_CTL_CLEAR);
+ 	ppe_clear(ppe, MTK_PPE_CACHE_CTL, MTK_PPE_CACHE_CTL_CLEAR);
++
++	/* lock the preserved cache line */
++	if (mtk_is_netsys_v2_or_greater(ppe->eth))
++		mtk_ppe_cache_write(ppe, 0, 0x7FFF, 3, NULL);
++	else
++		mtk_ppe_cache_write(ppe, 0, 0x3FFF, 3, NULL);
++
++	/* restore cache enable */
++	ppe_m32(ppe, MTK_PPE_CACHE_CTL, MTK_PPE_CACHE_CTL_EN,
++		FIELD_PREP(MTK_PPE_CACHE_CTL_EN, cah_en));
++	/* restore scan mode */
++	ppe_m32(ppe, MTK_PPE_TB_CFG, MTK_PPE_TB_CFG_SCAN_MODE,
++		FIELD_PREP(MTK_PPE_TB_CFG_SCAN_MODE, scan_mode));
++out:
++	/* restore table learning */
++	ppe_w32(ppe, MTK_PPE_FLOW_CFG, flow_cfg);
++
++	spin_unlock_bh(&ppe->cache_lock);
+ }
+ 
+ static void mtk_ppe_cache_enable(struct mtk_ppe *ppe, bool enable)
+ {
+-	mtk_ppe_cache_clear(ppe);
++	if (enable)
++		mtk_ppe_cache_clear(ppe);
+ 
+ 	ppe_m32(ppe, MTK_PPE_CACHE_CTL, MTK_PPE_CACHE_CTL_EN,
+ 		enable * MTK_PPE_CACHE_CTL_EN);
+@@ -223,6 +370,17 @@ mtk_foe_entry_ib2(struct mtk_eth *eth, s
+ 	return &entry->ipv4.ib2;
+ }
+ 
++static inline u32 *
++mtk_foe_entry_udf(struct mtk_eth *eth, struct mtk_foe_entry *entry)
++{
++	int type = mtk_get_ib1_pkt_type(eth, entry->ib1);
++
++	if (type >= MTK_PPE_PKT_TYPE_IPV4_DSLITE)
++		return &entry->ipv6.udf;
++
++	return &entry->ipv4.udf_tsid;
++}
++
+ int mtk_foe_entry_prepare(struct mtk_eth *eth, struct mtk_foe_entry *entry,
+ 			  int type, int l4proto, u8 pse_port, u8 *src_mac,
+ 			  u8 *dest_mac)
+@@ -255,9 +413,6 @@ int mtk_foe_entry_prepare(struct mtk_eth
+ 		      FIELD_PREP(MTK_FOE_IB2_PORT_AG, 0x1f);
+ 	}
+ 
+-	if (is_multicast_ether_addr(dest_mac))
+-		val |= mtk_get_ib2_multicast_mask(eth);
+-
+ 	ports_pad = 0xa5a5a500 | (l4proto & 0xff);
+ 	if (type == MTK_PPE_PKT_TYPE_IPV4_ROUTE)
+ 		entry->ipv4.orig.ports = ports_pad;
+@@ -393,7 +548,24 @@ int mtk_foe_entry_set_dsa(struct mtk_eth
+ 	else
+ 		l2->etype |= BIT(8);
+ 
+-	entry->ib1 &= ~mtk_get_ib1_vlan_tag_mask(eth);
++	entry->ib1 |= mtk_get_ib1_sp_tag_mask(eth);
++
++	return 0;
++}
++
++int mtk_foe_entry_set_dscp(struct mtk_eth *eth, struct mtk_foe_entry *entry,
++			   unsigned int dscp)
++{
++	u32 *ib2 = mtk_foe_entry_ib2(eth, entry);
++
++	*ib2 &= ~MTK_FOE_IB2_DSCP;
++	*ib2 |= FIELD_PREP(MTK_FOE_IB2_DSCP, dscp);
++
++	if (mtk_is_netsys_v3_or_greater(eth) && eth->dscp_toggle == 1) {
++		u32 *udf = mtk_foe_entry_udf(eth, entry);
++		*udf |= FIELD_PREP(MTK_FOE_UDF_KEEP_ECN, 1) |
++			FIELD_PREP(MTK_FOE_UDF_KEEP_DSCP, 1);
++	}
+ 
+ 	return 0;
+ }
+@@ -405,12 +577,12 @@ int mtk_foe_entry_set_vlan(struct mtk_et
+ 
+ 	switch (mtk_get_ib1_vlan_layer(eth, entry->ib1)) {
+ 	case 0:
+-		entry->ib1 |= mtk_get_ib1_vlan_tag_mask(eth) |
+-			      mtk_prep_ib1_vlan_layer(eth, 1);
++		entry->ib1 |= mtk_prep_ib1_vlan_layer(eth, 1);
++		l2->etype = ETH_P_8021Q;
+ 		l2->vlan1 = vid;
+ 		return 0;
+ 	case 1:
+-		if (!(entry->ib1 & mtk_get_ib1_vlan_tag_mask(eth))) {
++		if (l2->etype != ETH_P_8021Q) {
+ 			l2->vlan1 = vid;
+ 			l2->etype |= BIT(8);
+ 		} else {
+@@ -428,8 +600,7 @@ int mtk_foe_entry_set_pppoe(struct mtk_e
+ {
+ 	struct mtk_foe_mac_info *l2 = mtk_foe_entry_l2(eth, entry);
+ 
+-	if (!(entry->ib1 & mtk_get_ib1_vlan_layer_mask(eth)) ||
+-	    (entry->ib1 & mtk_get_ib1_vlan_tag_mask(eth)))
++	if (!(entry->ib1 & mtk_get_ib1_vlan_layer_mask(eth)))
+ 		l2->etype = ETH_P_PPP_SES;
+ 
+ 	entry->ib1 |= mtk_get_ib1_ppoe_mask(eth);
+@@ -497,11 +668,16 @@ int mtk_foe_entry_set_queue(struct mtk_e
+ 		l2->tport |= FIELD_PREP(MTK_FOE_TPORT_IDX, 1);
+ 	}
+ 
++	if (mtk_is_netsys_v3_or_greater(eth)) {
++		struct mtk_foe_mac_info *l2 = mtk_foe_entry_l2(eth, entry);
++		l2->tport &= ~MTK_FOE_TPORT_IDX;
++		l2->tport |= FIELD_PREP(MTK_FOE_TPORT_IDX, TPORT_QDMA);
++	}
++
+ 	return 0;
+ }
+ 
+-static int
+-mtk_flow_entry_match_len(struct mtk_eth *eth, struct mtk_foe_entry *entry)
++int mtk_flow_entry_match_len(struct mtk_eth *eth, struct mtk_foe_entry *entry)
+ {
+ 	int type = mtk_get_ib1_pkt_type(eth, entry->ib1);
+ 
+@@ -511,9 +687,8 @@ mtk_flow_entry_match_len(struct mtk_eth
+ 		return offsetof(struct mtk_foe_entry, ipv4.ib2);
+ }
+ 
+-static bool
+-mtk_flow_entry_match(struct mtk_eth *eth, struct mtk_flow_entry *entry,
+-		     struct mtk_foe_entry *data, int len)
++bool mtk_flow_entry_match(struct mtk_eth *eth, struct mtk_flow_entry *entry,
++			  struct mtk_foe_entry *data, int len)
+ {
+ 	if ((data->ib1 ^ entry->data.ib1) & MTK_FOE_IB1_UDP)
+ 		return false;
+@@ -526,6 +701,7 @@ __mtk_foe_entry_clear(struct mtk_ppe *pp
+ 		      bool set_state)
+ {
+ 	struct hlist_node *tmp;
++	int state;
+ 
+ 	if (entry->type == MTK_FLOW_TYPE_L2) {
+ 		rhashtable_remove_fast(&ppe->l2_flows, &entry->l2_node,
+@@ -539,10 +715,13 @@ __mtk_foe_entry_clear(struct mtk_ppe *pp
+ 	if (entry->hash != 0xffff && set_state) {
+ 		struct mtk_foe_entry *hwe = mtk_foe_get_entry(ppe, entry->hash);
+ 
++		state = FIELD_GET(MTK_FOE_IB1_STATE, hwe->ib1);
++
+ 		hwe->ib1 &= ~MTK_FOE_IB1_STATE;
+ 		hwe->ib1 |= FIELD_PREP(MTK_FOE_IB1_STATE, MTK_FOE_STATE_INVALID);
+ 		dma_wmb();
+-		mtk_ppe_cache_clear(ppe);
++		if (state == MTK_FOE_STATE_BIND)
++			mtk_ppe_cache_clear(ppe);
+ 	}
+ 	entry->hash = 0xffff;
+ 
+@@ -667,7 +846,12 @@ __mtk_foe_entry_commit(struct mtk_ppe *p
+ 	struct mtk_foe_entry *hwe;
+ 	u32 val;
+ 
++	hwe = mtk_foe_get_entry(ppe, hash);
++
+ 	if (mtk_is_netsys_v2_or_greater(eth)) {
++		entry->ib1 &= ~MTK_FOE_IB1_BIND_SRC_PORT_V2;
++		entry->ib1 |= FIELD_PREP(MTK_FOE_IB1_BIND_SRC_PORT_V2,
++					 mtk_get_ib1_sp(eth, hwe));
+ 		entry->ib1 &= ~MTK_FOE_IB1_BIND_TIMESTAMP_V2;
+ 		entry->ib1 |= FIELD_PREP(MTK_FOE_IB1_BIND_TIMESTAMP_V2,
+ 					 timestamp);
+@@ -677,7 +861,6 @@ __mtk_foe_entry_commit(struct mtk_ppe *p
+ 					 timestamp);
+ 	}
+ 
+-	hwe = mtk_foe_get_entry(ppe, hash);
+ 	memcpy(&hwe->data, &entry->data, eth->soc->foe_entry_size - sizeof(hwe->ib1));
+ 	wmb();
+ 	hwe->ib1 = entry->ib1;
+@@ -697,8 +880,6 @@ __mtk_foe_entry_commit(struct mtk_ppe *p
+ 		acct->packets = 0;
+ 		acct->bytes = 0;
+ 	}
+-
+-	mtk_ppe_cache_clear(ppe);
+ }
+ 
+ void mtk_foe_entry_clear(struct mtk_ppe *ppe, struct mtk_flow_entry *entry)
+@@ -944,6 +1125,7 @@ struct mtk_ppe *mtk_ppe_init(struct mtk_
+ 	ppe->base = base;
+ 	ppe->eth = eth;
+ 	ppe->dev = dev;
++	ppe->index = index;
+ 	ppe->version = eth->soc->offload_version;
+ 	ppe->accounting = accounting;
+ 
+@@ -980,6 +1162,8 @@ struct mtk_ppe *mtk_ppe_init(struct mtk_
+ 		ppe->acct_table = acct;
+ 	}
+ 
++	spin_lock_init(&ppe->cache_lock);
++
+ 	mtk_ppe_debugfs_init(ppe, index);
+ 
+ 	return ppe;
+@@ -1078,6 +1262,9 @@ void mtk_ppe_start(struct mtk_ppe *ppe)
+ 			 MTK_PPE_ENTRIES_SHIFT);
+ 	if (mtk_is_netsys_v2_or_greater(ppe->eth))
+ 		val |= MTK_PPE_TB_CFG_INFO_SEL;
++	if (mtk_is_netsys_v3_or_greater(ppe->eth))
++		val |= MTK_PPE_TB_CFG_KEEP_DSCP_ECN_EN |
++		       MTK_PPE_TB_CFG_IS_SP_TAG_EN;
+ 	if (!mtk_is_netsys_v3_or_greater(ppe->eth))
+ 		val |= MTK_PPE_TB_CFG_ENTRY_80B;
+ 	ppe_w32(ppe, MTK_PPE_TB_CFG, val);
+@@ -1085,8 +1272,6 @@ void mtk_ppe_start(struct mtk_ppe *ppe)
+ 	ppe_w32(ppe, MTK_PPE_IP_PROTO_CHK,
+ 		MTK_PPE_IP_PROTO_CHK_IPV4 | MTK_PPE_IP_PROTO_CHK_IPV6);
+ 
+-	mtk_ppe_cache_enable(ppe, true);
+-
+ 	val = MTK_PPE_FLOW_CFG_IP6_3T_ROUTE |
+ 	      MTK_PPE_FLOW_CFG_IP6_5T_ROUTE |
+ 	      MTK_PPE_FLOW_CFG_IP6_6RD |
+@@ -1108,12 +1293,12 @@ void mtk_ppe_start(struct mtk_ppe *ppe)
+ 	      FIELD_PREP(MTK_PPE_UNBIND_AGE_DELTA, 3);
+ 	ppe_w32(ppe, MTK_PPE_UNBIND_AGE, val);
+ 
+-	val = FIELD_PREP(MTK_PPE_BIND_AGE0_DELTA_UDP, 12) |
++	val = FIELD_PREP(MTK_PPE_BIND_AGE0_DELTA_UDP, 30) |
+ 	      FIELD_PREP(MTK_PPE_BIND_AGE0_DELTA_NON_L4, 1);
+ 	ppe_w32(ppe, MTK_PPE_BIND_AGE0, val);
+ 
+ 	val = FIELD_PREP(MTK_PPE_BIND_AGE1_DELTA_TCP_FIN, 1) |
+-	      FIELD_PREP(MTK_PPE_BIND_AGE1_DELTA_TCP, 7);
++	      FIELD_PREP(MTK_PPE_BIND_AGE1_DELTA_TCP, 30);
+ 	ppe_w32(ppe, MTK_PPE_BIND_AGE1, val);
+ 
+ 	val = MTK_PPE_BIND_LIMIT0_QUARTER | MTK_PPE_BIND_LIMIT0_HALF;
+@@ -1132,8 +1317,14 @@ void mtk_ppe_start(struct mtk_ppe *ppe)
+ 	      MTK_PPE_GLO_CFG_IP4_L4_CS_DROP |
+ 	      MTK_PPE_GLO_CFG_IP4_CS_DROP |
+ 	      MTK_PPE_GLO_CFG_FLOW_DROP_UPDATE;
++	if (mtk_is_netsys_v3_or_greater(ppe->eth)) {
++		val |= MTK_PPE_GLO_CFG_CS0_PIPE_EN |
++		       MTK_PPE_GLO_CFG_SRH_CACHE_FIRST_EN;
++	}
+ 	ppe_w32(ppe, MTK_PPE_GLO_CFG, val);
+ 
++	mtk_ppe_cache_enable(ppe, true);
++
+ 	ppe_w32(ppe, MTK_PPE_DEFAULT_CPU_PORT, 0);
+ 
+ 	if (mtk_is_netsys_v2_or_greater(ppe->eth)) {
+@@ -1148,7 +1339,7 @@ void mtk_ppe_start(struct mtk_ppe *ppe)
+ 		ppe_m32(ppe, MTK_PPE_MIB_CFG, MTK_PPE_MIB_CFG_RD_CLR,
+ 			MTK_PPE_MIB_CFG_RD_CLR);
+ 		ppe_m32(ppe, MTK_PPE_MIB_CACHE_CTL, MTK_PPE_MIB_CACHE_CTL_EN,
+-			MTK_PPE_MIB_CFG_RD_CLR);
++			MTK_PPE_MIB_CACHE_CTL_EN);
+ 	}
+ }
+ 
+--- a/drivers/net/ethernet/mediatek/mtk_ppe.h
++++ b/drivers/net/ethernet/mediatek/mtk_ppe.h
+@@ -8,6 +8,7 @@
+ #include <linux/bitfield.h>
+ #include <linux/rhashtable.h>
+ 
++#define MTK_PPE_EXCEPTION_TAG		0x99
+ #define MTK_PPE_ENTRIES_SHIFT		4
+ #define MTK_PPE_ENTRIES			(1024 << MTK_PPE_ENTRIES_SHIFT)
+ #define MTK_PPE_HASH_MASK		(MTK_PPE_ENTRIES - 1)
+@@ -34,6 +35,7 @@
+ 
+ /* CONFIG_MEDIATEK_NETSYS_V2 */
+ #define MTK_FOE_IB1_BIND_TIMESTAMP_V2	GENMASK(7, 0)
++#define MTK_FOE_IB1_BIND_SRC_PORT_V2	GENMASK(11, 8)
+ #define MTK_FOE_IB1_BIND_VLAN_LAYER_V2	GENMASK(16, 14)
+ #define MTK_FOE_IB1_BIND_PPPOE_V2	BIT(17)
+ #define MTK_FOE_IB1_BIND_VLAN_TAG_V2	BIT(18)
+@@ -41,6 +43,9 @@
+ #define MTK_FOE_IB1_BIND_TTL_V2		BIT(22)
+ #define MTK_FOE_IB1_PACKET_TYPE_V2	GENMASK(27, 23)
+ 
++/* CONFIG_MEDIATEK_NETSYS_V3 */
++#define MTK_FOE_IB1_BIND_IS_SP_TAG_V3	BIT(18)
++
+ enum {
+ 	MTK_PPE_PKT_TYPE_IPV4_HNAPT = 0,
+ 	MTK_PPE_PKT_TYPE_IPV4_ROUTE = 1,
+@@ -96,6 +101,9 @@ enum {
+ #define MTK_FOE_WINFO_AMSDU_HF		BIT(23)
+ #define MTK_FOE_WINFO_AMSDU_EN		BIT(24)
+ 
++#define MTK_FOE_UDF_KEEP_ECN		BIT(9)
++#define MTK_FOE_UDF_KEEP_DSCP		BIT(10)
++
+ #define MTK_FOE_TPORT_IDX		GENMASK(3, 0)
+ 
+ enum {
+@@ -330,6 +338,7 @@ struct mtk_ppe {
+ 	struct mtk_eth *eth;
+ 	struct device *dev;
+ 	void __iomem *base;
++	int index;
+ 	int version;
+ 	char dirname[5];
+ 	bool accounting;
+@@ -346,6 +355,8 @@ struct mtk_ppe {
+ 	struct rhashtable l2_flows;
+ 
+ 	void *acct_table;
++
++	spinlock_t cache_lock;
+ };
+ 
+ struct mtk_ppe *mtk_ppe_init(struct mtk_eth *eth, void __iomem *base, int index);
+@@ -358,7 +369,6 @@ int mtk_ppe_prepare_reset(struct mtk_ppe
+ struct mtk_foe_accounting *mtk_ppe_mib_entry_read(struct mtk_ppe *ppe, u16 index);
+ 
+ void __mtk_ppe_check_skb(struct mtk_ppe *ppe, struct sk_buff *skb, u16 hash);
+-
+ static inline void
+ mtk_ppe_check_skb(struct mtk_ppe *ppe, struct sk_buff *skb, u16 hash)
+ {
+@@ -394,6 +404,8 @@ int mtk_foe_entry_set_ipv6_tuple(struct
+ 				 __be32 *dest_addr, __be16 dest_port);
+ int mtk_foe_entry_set_dsa(struct mtk_eth *eth, struct mtk_foe_entry *entry,
+ 			  int port);
++int mtk_foe_entry_set_dscp(struct mtk_eth *eth, struct mtk_foe_entry *entry,
++			   unsigned int dscp);
+ int mtk_foe_entry_set_vlan(struct mtk_eth *eth, struct mtk_foe_entry *entry,
+ 			   int vid);
+ int mtk_foe_entry_set_pppoe(struct mtk_eth *eth, struct mtk_foe_entry *entry,
+@@ -406,7 +418,11 @@ int mtk_foe_entry_set_queue(struct mtk_e
+ int mtk_foe_entry_commit(struct mtk_ppe *ppe, struct mtk_flow_entry *entry);
+ void mtk_foe_entry_clear(struct mtk_ppe *ppe, struct mtk_flow_entry *entry);
+ int mtk_ppe_debugfs_init(struct mtk_ppe *ppe, int index);
++int mtk_ppe_internal_debugfs_init(struct mtk_eth *eth);
+ void mtk_foe_entry_get_stats(struct mtk_ppe *ppe, struct mtk_flow_entry *entry,
+ 			     int *idle);
++int mtk_flow_entry_match_len(struct mtk_eth *eth, struct mtk_foe_entry *entry);
++bool mtk_flow_entry_match(struct mtk_eth *eth, struct mtk_flow_entry *entry,
++			  struct mtk_foe_entry *data, int len);
+ 
+ #endif
+--- a/drivers/net/ethernet/mediatek/mtk_ppe_debugfs.c
++++ b/drivers/net/ethernet/mediatek/mtk_ppe_debugfs.c
+@@ -126,6 +126,8 @@ mtk_ppe_debugfs_foe_show(struct seq_file
+ 			break;
+ 		}
+ 
++		seq_printf(m, " ppe=%d", ppe->index);
++
+ 		seq_printf(m, " orig=");
+ 		mtk_print_addr_info(m, &ai);
+ 
+@@ -193,3 +195,209 @@ int mtk_ppe_debugfs_init(struct mtk_ppe
+ 
+ 	return 0;
+ }
++
++static int
++mtk_ppe_internal_debugfs_read_dscp(struct seq_file *m, void *private)
++{
++	struct mtk_eth *eth = m->private;
++
++	if (eth->dscp_toggle == 0)
++		pr_info("Keep DSCP mode is disabled now!\n");
++	else if (eth->dscp_toggle == 1)
++		pr_info("Keep DSCP mode is enabled now!\n");
++
++	return 0;
++}
++
++static int mtk_ppe_internal_debugfs_open_dscp(struct inode *inode, struct file *file)
++{
++	return single_open(file, mtk_ppe_internal_debugfs_read_dscp,
++			   inode->i_private);
++}
++
++static ssize_t
++mtk_ppe_internal_debugfs_write_dscp(struct file *file, const char __user *buffer,
++				    size_t count, loff_t *data)
++{
++	struct seq_file *m = file->private_data;
++	struct mtk_eth *eth = m->private;
++	char buf[8];
++	int len = count;
++
++	if ((len > 8) || copy_from_user(buf, buffer, len))
++		return -EFAULT;
++
++	if (buf[0] == '0') {
++		pr_info("Keep DSCP mode is going to be disabled !\n");
++		eth->dscp_toggle = 0;
++	} else if (buf[0] == '1') {
++		pr_info("Keep DSCP mode is going to be enabled !\n");
++		eth->dscp_toggle = 1;
++	}
++
++	return len;
++}
++
++static const struct file_operations mtk_ppe_internal_debugfs_dscp_fops = {
++	.open = mtk_ppe_internal_debugfs_open_dscp,
++	.read = seq_read,
++	.llseek = seq_lseek,
++	.write = mtk_ppe_internal_debugfs_write_dscp,
++	.release = single_release,
++};
++
++static int
++mtk_ppe_internal_debugfs_read_qos(struct seq_file *m, void *private)
++{
++	struct mtk_eth *eth = m->private;
++
++	if (eth->qos_toggle == 0)
++		pr_info("HQoS is disabled now!\n");
++	else if (eth->qos_toggle == 1)
++		pr_info("HQoS is enabled now!\n");
++	else if (eth->qos_toggle == 2)
++		pr_info("Per-port-per-queue mode is enabled!\n");
++
++	return 0;
++}
++
++static int mtk_ppe_internal_debugfs_open_qos(struct inode *inode, struct file *file)
++{
++	return single_open(file, mtk_ppe_internal_debugfs_read_qos,
++			   inode->i_private);
++}
++
++static ssize_t
++mtk_ppe_internal_debugfs_write_qos(struct file *file, const char __user *buffer,
++				   size_t count, loff_t *data)
++{
++	struct seq_file *m = file->private_data;
++	struct mtk_eth *eth = m->private;
++	char buf[8];
++	int len = count;
++
++	if ((len > 8) || copy_from_user(buf, buffer, len))
++		return -EFAULT;
++
++	if (buf[0] == '0') {
++		pr_info("HQoS is going to be disabled !\n");
++		eth->qos_toggle = 0;
++	} else if (buf[0] == '1') {
++		pr_info("HQoS mode is going to be enabled !\n");
++		eth->qos_toggle = 1;
++	} else if (buf[0] == '2') {
++		pr_info("Per-port-per-queue mode is going to be enabled !\n");
++		pr_info("PPPQ use qid 3~14 (scheduler 0).\n");
++		eth->qos_toggle = 2;
++	}
++
++	return len;
++}
++
++static const struct file_operations mtk_ppe_internal_debugfs_qos_fops = {
++	.open = mtk_ppe_internal_debugfs_open_qos,
++	.read = seq_read,
++	.llseek = seq_lseek,
++	.write = mtk_ppe_internal_debugfs_write_qos,
++	.release = single_release,
++};
++
++static int
++mtk_ppe_internal_debugfs_foe_all_show(struct seq_file *m, void *private)
++{
++	struct mtk_eth *eth = m->private;
++	void *backup;
++	int i;
++
++	backup = m->private;
++	for (i = 0; i < eth->soc->ppe_num; i++) {
++		if (!eth->ppe[i])
++			continue;
++
++		m->private = eth->ppe[i];
++		mtk_ppe_debugfs_foe_show(m, private, false);
++	}
++	m->private = backup;
++
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(mtk_ppe_internal_debugfs_foe_all);
++
++static int
++mtk_ppe_internal_debugfs_foe_bind_show(struct seq_file *m, void *private)
++{
++	struct mtk_eth *eth = m->private;
++	void *backup;
++	int i;
++
++	backup = m->private;
++	for (i = 0; i < eth->soc->ppe_num; i++) {
++		if (!eth->ppe[i])
++			continue;
++
++		m->private = eth->ppe[i];
++		mtk_ppe_debugfs_foe_show(m, private, true);
++	}
++	m->private = backup;
++
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(mtk_ppe_internal_debugfs_foe_bind);
++
++int mtk_ppe_internal_debugfs_init(struct mtk_eth *eth)
++{
++	struct dentry *root;
++	char name[16], name_symlink[48];
++	long i;
++	int ret = 0;
++
++	mtk_eth_qos_debugfs_init(eth);
++
++	root = debugfs_create_dir("mtk_ppe", NULL);
++	if (!root)
++		return -ENOMEM;
++
++	debugfs_create_file("entries", S_IRUGO, root, eth,
++			    &mtk_ppe_internal_debugfs_foe_all_fops);
++	debugfs_create_file("bind", S_IRUGO, root, eth,
++			    &mtk_ppe_internal_debugfs_foe_bind_fops);
++	debugfs_create_file("dscp_toggle", S_IRUGO, root, eth,
++			    &mtk_ppe_internal_debugfs_dscp_fops);
++	debugfs_create_file("qos_toggle", S_IRUGO, root, eth,
++			    &mtk_ppe_internal_debugfs_qos_fops);
++
++	for (i = 0; i < (mtk_is_netsys_v2_or_greater(eth) ? 4 : 2); i++) {
++		ret = snprintf(name, sizeof(name), "qdma_sch%ld", i);
++		if (ret != strlen(name)) {
++			ret = -ENOMEM;
++			goto err;
++		}
++		ret = snprintf(name_symlink, sizeof(name_symlink),
++			       "/sys/kernel/debug/mtketh/qdma_sch%ld", i);
++		if (ret != strlen(name_symlink)) {
++			ret = -ENOMEM;
++			goto err;
++		}
++		debugfs_create_symlink(name, root, name_symlink);
++	}
++
++	for (i = 0; i < eth->soc->num_tx_queues; i++) {
++		ret = snprintf(name, sizeof(name), "qdma_txq%ld", i);
++		if (ret != strlen(name)) {
++			ret = -ENOMEM;
++			goto err;
++		}
++		ret = snprintf(name_symlink, sizeof(name_symlink),
++			       "/sys/kernel/debug/mtketh/qdma_txq%ld", i);
++		if (ret != strlen(name_symlink)) {
++			ret = -ENOMEM;
++			goto err;
++		}
++		debugfs_create_symlink(name, root, name_symlink);
++	}
++
++	return 0;
++
++err:
++	return ret;
++}
+--- a/drivers/net/ethernet/mediatek/mtk_ppe_offload.c
++++ b/drivers/net/ethernet/mediatek/mtk_ppe_offload.c
+@@ -9,6 +9,9 @@
+ #include <linux/ipv6.h>
+ #include <net/flow_offload.h>
+ #include <net/pkt_cls.h>
++#include <net/netfilter/nf_conntrack.h>
++#include <net/netfilter/nf_conntrack_acct.h>
++#include <net/netfilter/nf_flow_table.h>
+ #include <net/dsa.h>
+ #include <linux/dsa/8021q.h>
+ #include <linux/dsa/yt922x.h>
+@@ -229,16 +232,104 @@ mtk_flow_get_dsa_port(struct net_device
+ }
+ 
+ static int
++mtk_flow_get_ct_dir(struct mtk_eth *eth, struct mtk_foe_entry *foe,
++		    struct nf_conn *ct)
++{
++	const struct nf_conntrack_tuple *tuple;
++	struct mtk_flow_entry ct_entry;
++	struct mtk_foe_entry *ct_foe;
++	int i, j, len;
++
++	if (!eth || !foe || !ct)
++		return -EINVAL;
++
++	len = mtk_flow_entry_match_len(eth, foe);
++	ct_foe = &ct_entry.data;
++	ct_foe->ib1 = foe->ib1;
++
++	for (i = 0; i < IP_CT_DIR_MAX; i++) {
++		tuple = &ct->tuplehash[i].tuple;
++
++		if (mtk_get_ib1_pkt_type(eth, foe->ib1) > MTK_PPE_PKT_TYPE_IPV4_DSLITE) {
++			if (nf_ct_l3num(ct) != AF_INET6)
++				return -EINVAL;
++
++			for (j = 0; j < 4; j++) {
++				ct_foe->ipv6.src_ip[j] = ntohl(tuple->src.u3.in6.s6_addr32[j]);
++				ct_foe->ipv6.dest_ip[j] = ntohl(tuple->dst.u3.in6.s6_addr32[j]);
++			}
++			ct_foe->ipv6.src_port = ntohs(tuple->src.u.tcp.port);
++			ct_foe->ipv6.dest_port = ntohs( tuple->dst.u.tcp.port);
++		} else {
++			if (nf_ct_l3num(ct) != AF_INET)
++				return -EINVAL;
++
++			ct_foe->ipv4.orig.src_ip = ntohl(tuple->src.u3.ip);
++			ct_foe->ipv4.orig.dest_ip = ntohl(tuple->dst.u3.ip);
++			ct_foe->ipv4.orig.src_port = ntohs(tuple->src.u.tcp.port);
++			ct_foe->ipv4.orig.dest_port = ntohs(tuple->dst.u.tcp.port);
++		}
++
++		if (mtk_flow_entry_match(eth, &ct_entry, foe, len))
++			return i;
++	}
++
++	return -EINVAL;
++}
++
++static bool
++mtk_flow_is_tcp_ack(struct mtk_eth *eth, struct mtk_foe_entry *foe,
++		    struct nf_conn *ct)
++{
++	const struct nf_conn_counter *counters;
++	struct nf_conn_acct *acct;
++	u64 packets[IP_CT_DIR_MAX], bytes[IP_CT_DIR_MAX], avg[IP_CT_DIR_MAX];
++	int dir;
++
++	if (!ct)
++		return false;
++
++	dir = mtk_flow_get_ct_dir(eth, foe, ct);
++	if (dir < 0 || dir >= IP_CT_DIR_MAX)
++		return false;
++
++	acct = nf_conn_acct_find(ct);
++	if (!acct)
++		return false;
++
++	counters = acct->counter;
++	packets[dir] = atomic64_read(&counters[dir].packets);
++	bytes[dir] = atomic64_read(&counters[dir].bytes);
++	packets[!dir] = atomic64_read(&counters[!dir].packets);
++	bytes[!dir] = atomic64_read(&counters[!dir].bytes);
++
++	/* Avoid division by zero */
++	if (!packets[dir] || !packets[!dir])
++		return false;
++
++	avg[dir] = bytes[dir] / packets[dir];
++	avg[!dir] = bytes[!dir] / packets[!dir];
++
++	/* TCP ACKs are small packets (<= 64 bytes) compared to data packets */
++	return (avg[dir] <= 64 && avg[dir] < avg[!dir]);
++}
++
++static int
+ mtk_flow_set_output_device(struct mtk_eth *eth, struct mtk_foe_entry *foe,
+-			   struct net_device *dev, const u8 *dest_mac,
+-			   int *wed_index, unsigned int num_vlans)
++			   struct net_device *idev, struct net_device *odev,
++			   struct flow_cls_offload *f, const u8 *dest_mac,
++			   int *wed_index, unsigned int num_vlans, int dscp)
+ {
++	struct net_device *odev_conduit = odev;
+ 	struct mtk_wdma_info info = {};
+ 	struct mtk_mac *mac;
++	struct nf_conn *ct = NULL;
++	u32 ct_mark = 0;
++	u32 qmask = eth->soc->num_tx_queues - 1;
+ 	int pse_port, dsa_port, queue, err;
+ 	u16 push_vid = 0;
+ 
+-	if (mtk_flow_get_wdma_info(dev, dest_mac, &info) == 0) {
++	if (mtk_flow_get_wdma_info(odev, dest_mac, &info) == 0) {
+ 		mtk_foe_entry_set_wdma(eth, foe, info.wdma_idx, info.queue,
+ 				       info.bss, info.wcid, info.amsdu);
+ 		if (mtk_is_netsys_v2_or_greater(eth)) {
+@@ -262,13 +353,13 @@ mtk_flow_set_output_device(struct mtk_et
+ 		goto out;
+ 	}
+ 
+-	dsa_port = mtk_flow_get_dsa_port(&dev, &push_vid);
++	dsa_port = mtk_flow_get_dsa_port(&odev_conduit, &push_vid);
+ 
+-	if (dev == eth->netdev[0])
++	if (odev_conduit == eth->netdev[0])
+ 		pse_port = PSE_GDM1_PORT;
+-	else if (dev == eth->netdev[1])
++	else if (odev_conduit == eth->netdev[1])
+ 		pse_port = PSE_GDM2_PORT;
+-	else if (dev == eth->netdev[2])
++	else if (odev_conduit == eth->netdev[2])
+ 		pse_port = PSE_GDM3_PORT;
+ 	else
+ 		return -EOPNOTSUPP;
+@@ -289,15 +380,60 @@ mtk_flow_set_output_device(struct mtk_et
+ 	}
+ 
+ 	if (dsa_port >= 0 && dsa_port < MTK_DSA_USER_PORT_MAX) {
+-		mac = netdev_priv(dev);
++		mac = netdev_priv(odev_conduit);
+ 		queue = mac->dsa_queue_base + mac->dsa_port_rank[dsa_port];
+ 	} else {
+-		queue = pse_port - 1;
++		queue = (pse_port == PSE_GDM3_PORT) ? 2 : pse_port - 1;
++	}
++
++	if (f->flow && f->flow->ct) {
++		ct = f->flow->ct;
++		ct_mark = ct->mark;
++	}
++
++	if (eth->qos_toggle == 2 && mtk_ppe_check_pppq_path(eth, idev, odev, dsa_port)) {
++		if ((dsa_port >= 0) && ct && nf_ct_protonum(ct) == IPPROTO_TCP) {
++			/* Dispatch the IPv4/IPv6 TCP Ack packets to the high-priority
++			 * queue, assuming they are less than 64 bytes.
++			 */
++			if (mtk_flow_is_tcp_ack(eth, foe, ct))
++				queue += 6;
++		}
++		mtk_foe_entry_set_queue(eth, foe, queue);
++	} else if (eth->qos_toggle == 1 || (ct_mark & qmask) >= 15) {
++		u8 qos_ul_toggle;
++		bool ul_dev;
++		u32 q;
++
++		if (eth->qos_toggle == 2)
++			qos_ul_toggle = ((ct_mark >> 16) & qmask) >= 15 ? 1 : 0;
++		else
++			qos_ul_toggle = ((ct_mark >> 16) & qmask) >= 1 ? 1 : 0;
++
++		/* Vendor convention: GMAC1 is the uplink. With a DSA WAN port the
++		 * egress netdev is the user port, so allow it to be named via
++		 * debugfs (mtketh/qos_ul_dev) instead.
++		 */
++		if (eth->qos_ul_ifindex)
++			ul_dev = odev->ifindex == eth->qos_ul_ifindex;
++		else
++			ul_dev = odev == eth->netdev[1];
++
++		if (qos_ul_toggle == 1 && ul_dev)
++			q = (ct_mark >> 16) & qmask;
++		else
++			q = ct_mark & qmask;
++		/* Unmarked flows keep mainline's per-port queue. */
++		if (!q)
++			q = queue;
++		mtk_foe_entry_set_queue(eth, foe, q);
++	} else {
++		mtk_foe_entry_set_queue(eth, foe, queue);
+ 	}
+-	mtk_foe_entry_set_queue(eth, foe, queue);
+ 
+ out:
+ 	mtk_foe_entry_set_pse_port(eth, foe, pse_port);
++	mtk_foe_entry_set_dscp(eth, foe, dscp);
+ 
+ 	return 0;
+ }
+@@ -335,6 +471,7 @@ mtk_flow_offload_replace(struct mtk_eth
+ 	int wed_index = -1;
+ 	u16 addr_type = 0;
+ 	u8 l4proto = 0;
++	u8 dscp = 0;
+ 	int err = 0;
+ 	int i;
+ 
+@@ -342,6 +479,9 @@ mtk_flow_offload_replace(struct mtk_eth
+ 				   mtk_flow_ht_params))
+ 		return -EEXIST;
+ 
++	if (f->flow && f->flow->ct && f->flow->ct->mark == MTK_PPE_EXCEPTION_TAG)
++		return -EOPNOTSUPP;
++
+ 	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_META)) {
+ 		struct flow_match_meta match;
+ 
+@@ -394,6 +534,13 @@ mtk_flow_offload_replace(struct mtk_eth
+ 		return -EOPNOTSUPP;
+ 	}
+ 
++	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_IP)) {
++		struct flow_match_ip match;
++
++		flow_rule_match_ip(rule, &match);
++		dscp = match.key->tos;
++	}
++
+ 	switch (addr_type) {
+ 	case 0:
+ 		offload_type = MTK_PPE_PKT_TYPE_BRIDGE;
+@@ -541,8 +688,9 @@ mtk_flow_offload_replace(struct mtk_eth
+ 			return err;
+ 	}
+ 
+-	err = mtk_flow_set_output_device(eth, &foe, odev, data.eth.h_dest,
+-					 &wed_index, data.vlan.num);
++	err = mtk_flow_set_output_device(eth, &foe, idev, odev, f,
++					 data.eth.h_dest, &wed_index, data.vlan.num,
++					 dscp);
+ 	if (err)
+ 		return err;
+ 
+@@ -738,7 +886,15 @@ int mtk_eth_setup_tc(struct net_device *
+ 
+ int mtk_eth_offload_init(struct mtk_eth *eth, u8 id)
+ {
++	int err;
++
+ 	if (!eth->ppe[id] || !eth->ppe[id]->foe_table)
+ 		return 0;
+-	return rhashtable_init(&eth->flow_table, &mtk_flow_ht_params);
++	err = rhashtable_init(&eth->flow_table, &mtk_flow_ht_params);
++	/* HQoS: expose /sys/kernel/debug/mtk_ppe (qos_toggle etc.) and the
++	 * mtketh QDMA shaper files once, with the first PPE.
++	 */
++	if (!err && id == 0)
++		mtk_ppe_internal_debugfs_init(eth);
++	return err;
+ }
+--- a/drivers/net/ethernet/mediatek/mtk_ppe_regs.h
++++ b/drivers/net/ethernet/mediatek/mtk_ppe_regs.h
+@@ -18,9 +18,12 @@
+ #define MTK_PPE_GLO_CFG_UDP_LITE_EN		BIT(10)
+ #define MTK_PPE_GLO_CFG_UDP_LEN_DROP		BIT(11)
+ #define MTK_PPE_GLO_CFG_MCAST_ENTRIES		GNEMASK(13, 12)
++#define MTK_PPE_GLO_CFG_CS0_PIPE_EN		BIT(29)
++#define MTK_PPE_GLO_CFG_SRH_CACHE_FIRST_EN	BIT(30)
+ #define MTK_PPE_GLO_CFG_BUSY			BIT(31)
+ 
+ #define MTK_PPE_FLOW_CFG			0x204
++#define MTK_PPE_ALERT_TCP_FIN_RST_SYN		BIT(0)
+ #define MTK_PPE_MD_TOAP_BYP_CRSN0		BIT(1)
+ #define MTK_PPE_MD_TOAP_BYP_CRSN1		BIT(2)
+ #define MTK_PPE_MD_TOAP_BYP_CRSN2		BIT(3)
+@@ -38,6 +41,9 @@
+ #define MTK_PPE_FLOW_CFG_IP4_HASH_FLOW_LABEL	BIT(18)
+ #define MTK_PPE_FLOW_CFG_IP4_HASH_GRE_KEY	BIT(19)
+ #define MTK_PPE_FLOW_CFG_IP6_HASH_GRE_KEY	BIT(20)
++#define MTK_PPE_FLOW_CFG_CS0_RM_ALL_IP6_IP_EN	BIT(25)
++#define MTK_PPE_FLOW_CFG_L2_HASH_ETH		BIT(29)
++#define MTK_PPE_FLOW_CFG_L2_HASH_VID		BIT(30)
+ 
+ #define MTK_PPE_IP_PROTO_CHK			0x208
+ #define MTK_PPE_IP_PROTO_CHK_IPV4		GENMASK(15, 0)
+@@ -59,6 +65,8 @@
+ #define MTK_PPE_TB_CFG_HASH_DEBUG		GENMASK(19, 18)
+ #define MTK_PPE_TB_CFG_INFO_SEL			BIT(20)
+ #define MTK_PPE_TB_TICK_SEL			BIT(24)
++#define MTK_PPE_TB_CFG_KEEP_DSCP_ECN_EN		BIT(25)
++#define MTK_PPE_TB_CFG_IS_SP_TAG_EN		BIT(26)
+ 
+ #define MTK_PPE_BIND_LMT1			0x230
+ #define MTK_PPE_NTU_KEEPALIVE			GENMASK(23, 16)
+@@ -142,6 +150,13 @@ enum {
+ #define MTK_PPE_CACHE_CTL_REQ			BIT(8)
+ #define MTK_PPE_CACHE_CTL_CLEAR			BIT(9)
+ #define MTK_PPE_CACHE_CTL_CMD			GENMASK(13, 12)
++#define MTK_PPE_CACHE_CTL_DATA_SEL		GENMASK(19, 18)
++
++#define MTK_PPE_CACHE_RW			0x328
++#define MTK_PPE_CACHE_RW_LINE			GENMASK(15, 0)
++#define MTK_PPE_CACHE_RW_OFFSET			GENMASK(23, 16)
++
++#define MTK_PPE_CACHE_WDATA			0x32C
+ 
+ #define MTK_PPE_MIB_CFG				0x334
+ #define MTK_PPE_MIB_CFG_EN			BIT(0)
+@@ -171,4 +186,7 @@ enum {
+ 
+ #define MTK_PPE_SBW_CTRL			0x374
+ 
++#define MTK_PPE_CACHE_DBG			0x390
++#define MTK_PPE_CACHE_DBG_BUSY			GENMASK(3, 0)
++
+ #endif
+--- a/include/net/flow_offload.h
++++ b/include/net/flow_offload.h
+@@ -696,6 +696,7 @@ struct flow_cls_offload {
+ 	enum flow_cls_command command;
+ 	bool use_act_stats;
+ 	unsigned long cookie;
++	struct flow_offload *flow;
+ 	struct flow_rule *rule;
+ 	struct flow_stats stats;
+ 	u32 classid;
+--- a/include/net/netfilter/nf_conntrack_extend.h
++++ b/include/net/netfilter/nf_conntrack_extend.h
+@@ -13,6 +13,7 @@ enum nf_ct_ext_id {
+ #endif
+ 	NF_CT_EXT_SEQADJ,
+ 	NF_CT_EXT_ACCT,
++	NF_CT_EXT_QOS,
+ #ifdef CONFIG_NF_CONNTRACK_EVENTS
+ 	NF_CT_EXT_ECACHE,
+ #endif
+--- /dev/null
++++ b/include/net/netfilter/nf_conntrack_qos.h
+@@ -0,0 +1,64 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Copyright (C) 2025 MediaTek Inc.
++ */
++
++#ifndef _NF_CONNTRACK_QOS_H
++#define _NF_CONNTRACK_QOS_H
++#include <net/net_namespace.h>
++#include <linux/netfilter/nf_conntrack_common.h>
++#include <linux/netfilter/nf_conntrack_tuple_common.h>
++#include <net/netfilter/nf_conntrack.h>
++#include <net/netfilter/nf_conntrack_extend.h>
++
++struct nf_conn_tos {
++	u8		value;
++	atomic64_t	counter;
++};
++
++struct nf_conn_qos {
++	struct nf_conn_tos	tos[IP_CT_DIR_MAX];
++};
++
++static inline
++struct nf_conn_qos *nf_conn_qos_find(const struct nf_conn *ct)
++{
++	return nf_ct_ext_find(ct, NF_CT_EXT_QOS);
++}
++
++static inline
++struct nf_conn_qos *nf_ct_qos_ext_add(struct nf_conn *ct, gfp_t gfp)
++{
++#if IS_ENABLED(CONFIG_NF_CONNTRACK)
++	struct net *net = nf_ct_net(ct);
++	struct nf_conn_qos *qos;
++
++	if (!net->ct.sysctl_qos)
++		return NULL;
++
++	qos = nf_ct_ext_add(ct, NF_CT_EXT_QOS, gfp);
++	if (!qos)
++		pr_debug("failed to add qos extension area");
++
++	memset(qos, 0, sizeof(struct nf_conn_qos));
++
++	return qos;
++#else
++	return NULL;
++#endif
++}
++
++static inline void nf_ct_qos_clear(struct nf_conn *ct)
++{
++#if IS_ENABLED(CONFIG_NF_CONNTRACK)
++	struct nf_conn_qos *qos;
++
++	qos = nf_ct_ext_find(ct, NF_CT_EXT_QOS);
++	if (qos)
++		memset(qos, 0, sizeof(struct nf_conn_qos));
++#endif
++}
++
++void nf_conntrack_qos_pernet_init(struct net *net);
++
++#endif /* _NF_CONNTRACK_QOS_H */
+--- a/include/net/netfilter/nf_flow_table.h
++++ b/include/net/netfilter/nf_flow_table.h
+@@ -36,6 +36,7 @@ struct nf_flow_key {
+ 	};
+ 	struct flow_dissector_key_tcp			tcp;
+ 	struct flow_dissector_key_ports			tp;
++	struct flow_dissector_key_ip			ip;
+ } __aligned(BITS_PER_LONG / 8); /* Ensure that we can do comparisons as longs. */
+ 
+ struct nf_flow_match {
+@@ -137,6 +138,7 @@ struct flow_offload_tuple {
+ 					xmit_type:3,
+ 					encap_num:2,
+ 					in_vlan_ingress:2;
++	u8				tos;
+ 	u16				mtu;
+ 	union {
+ 		struct {
+@@ -301,6 +303,7 @@ int nf_flow_table_init(struct nf_flowtab
+ void nf_flow_table_free(struct nf_flowtable *flow_table);
+ 
+ void flow_offload_teardown(struct flow_offload *flow);
++void flow_offload_teardown_by_tuple(struct flow_offload_tuple *tuple);
+ 
+ int nf_flow_table_iterate(struct nf_flowtable *flow_table,
+                       void (*iter)(struct nf_flowtable *flowtable,
+--- a/include/net/netns/conntrack.h
++++ b/include/net/netns/conntrack.h
+@@ -87,6 +87,7 @@ struct netns_ct {
+ 	u8			sysctl_log_invalid; /* Log invalid packets */
+ 	u8			sysctl_events;
+ 	u8			sysctl_acct;
++	u8			sysctl_qos;
+ 	u8			sysctl_tstamp;
+ 	u8			sysctl_checksum;
+ 
+--- a/net/netfilter/Makefile
++++ b/net/netfilter/Makefile
+@@ -4,7 +4,7 @@ netfilter-objs := core.o nf_log.o nf_que
+ nf_conntrack-y	:= nf_conntrack_core.o nf_conntrack_standalone.o nf_conntrack_expect.o nf_conntrack_helper.o \
+ 		   nf_conntrack_proto.o nf_conntrack_proto_generic.o nf_conntrack_proto_tcp.o nf_conntrack_proto_udp.o \
+ 		   nf_conntrack_proto_icmp.o \
+-		   nf_conntrack_extend.o nf_conntrack_acct.o nf_conntrack_seqadj.o
++		   nf_conntrack_extend.o nf_conntrack_acct.o nf_conntrack_qos.o nf_conntrack_seqadj.o
+ 
+ nf_conntrack-$(subst m,y,$(CONFIG_IPV6)) += nf_conntrack_proto_icmpv6.o
+ nf_conntrack-$(CONFIG_NF_CONNTRACK_TIMEOUT) += nf_conntrack_timeout.o
+--- a/net/netfilter/nf_conntrack_core.c
++++ b/net/netfilter/nf_conntrack_core.c
+@@ -41,6 +41,7 @@
+ #include <net/netfilter/nf_conntrack_core.h>
+ #include <net/netfilter/nf_conntrack_extend.h>
+ #include <net/netfilter/nf_conntrack_acct.h>
++#include <net/netfilter/nf_conntrack_qos.h>
+ #include <net/netfilter/nf_conntrack_ecache.h>
+ #include <net/netfilter/nf_conntrack_zones.h>
+ #include <net/netfilter/nf_conntrack_timestamp.h>
+@@ -1751,6 +1752,7 @@ init_conntrack(struct net *net, struct n
+ 				      GFP_ATOMIC);
+ 
+ 	nf_ct_acct_ext_add(ct, GFP_ATOMIC);
++	nf_ct_qos_ext_add(ct, GFP_ATOMIC);
+ 	nf_ct_tstamp_ext_add(ct, GFP_ATOMIC);
+ 	nf_ct_labels_ext_add(ct);
+ 
+@@ -2716,6 +2718,7 @@ int nf_conntrack_init_net(struct net *ne
+ 		goto err_expect;
+ 
+ 	nf_conntrack_acct_pernet_init(net);
++	nf_conntrack_qos_pernet_init(net);
+ 	nf_conntrack_tstamp_pernet_init(net);
+ 	nf_conntrack_ecache_pernet_init(net);
+ 	nf_conntrack_proto_pernet_init(net);
+--- a/net/netfilter/nf_conntrack_extend.c
++++ b/net/netfilter/nf_conntrack_extend.c
+@@ -23,6 +23,7 @@
+ #include <net/netfilter/nf_conntrack_labels.h>
+ #include <net/netfilter/nf_conntrack_synproxy.h>
+ #include <net/netfilter/nf_conntrack_act_ct.h>
++#include <net/netfilter/nf_conntrack_qos.h>
+ #include <net/netfilter/nf_nat.h>
+ 
+ #define NF_CT_EXT_PREALLOC	128u /* conntrack events are on by default */
+@@ -34,6 +35,7 @@ static const u8 nf_ct_ext_type_len[NF_CT
+ #endif
+ 	[NF_CT_EXT_SEQADJ] = sizeof(struct nf_conn_seqadj),
+ 	[NF_CT_EXT_ACCT] = sizeof(struct nf_conn_acct),
++	[NF_CT_EXT_QOS] = sizeof(struct nf_conn_qos),
+ #ifdef CONFIG_NF_CONNTRACK_EVENTS
+ 	[NF_CT_EXT_ECACHE] = sizeof(struct nf_conntrack_ecache),
+ #endif
+--- a/net/netfilter/nf_conntrack_netlink.c
++++ b/net/netfilter/nf_conntrack_netlink.c
+@@ -42,6 +42,7 @@
+ #include <net/netfilter/nf_conntrack_l4proto.h>
+ #include <net/netfilter/nf_conntrack_tuple.h>
+ #include <net/netfilter/nf_conntrack_acct.h>
++#include <net/netfilter/nf_conntrack_qos.h>
+ #include <net/netfilter/nf_conntrack_zones.h>
+ #include <net/netfilter/nf_conntrack_timestamp.h>
+ #include <net/netfilter/nf_conntrack_labels.h>
+@@ -2304,6 +2305,7 @@ ctnetlink_create_conntrack(struct net *n
+ 		goto err2;
+ 
+ 	nf_ct_acct_ext_add(ct, GFP_ATOMIC);
++	nf_ct_qos_ext_add(ct, GFP_ATOMIC);
+ 	nf_ct_tstamp_ext_add(ct, GFP_ATOMIC);
+ 	nf_ct_ecache_ext_add(ct, 0, 0, GFP_ATOMIC);
+ 	nf_ct_labels_ext_add(ct);
+--- /dev/null
++++ b/net/netfilter/nf_conntrack_qos.c
+@@ -0,0 +1,29 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) 2025 MediaTek Inc.
++ */
++
++/* QoS handling for netfilter. */
++
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
++#include <linux/netfilter.h>
++#include <linux/slab.h>
++#include <linux/kernel.h>
++#include <linux/moduleparam.h>
++#include <linux/export.h>
++
++#include <net/netfilter/nf_conntrack.h>
++#include <net/netfilter/nf_conntrack_extend.h>
++#include <net/netfilter/nf_conntrack_qos.h>
++
++static unsigned short nf_ct_qos __read_mostly = 3;
++
++module_param_named(qos, nf_ct_qos, ushort, 0644);
++MODULE_PARM_DESC(qos, "Enable connection tracking qos.");
++
++void nf_conntrack_qos_pernet_init(struct net *net)
++{
++	net->ct.sysctl_qos = nf_ct_qos;
++}
++
+--- a/net/netfilter/nf_conntrack_standalone.c
++++ b/net/netfilter/nf_conntrack_standalone.c
+@@ -22,6 +22,7 @@
+ #include <net/netfilter/nf_conntrack_expect.h>
+ #include <net/netfilter/nf_conntrack_helper.h>
+ #include <net/netfilter/nf_conntrack_acct.h>
++#include <net/netfilter/nf_conntrack_qos.h>
+ #include <net/netfilter/nf_conntrack_zones.h>
+ #include <net/netfilter/nf_conntrack_timestamp.h>
+ #include <linux/rculist_nulls.h>
+@@ -301,6 +302,18 @@ seq_print_acct(struct seq_file *s, const
+ 		   (unsigned long long)atomic64_read(&counter[dir].bytes));
+ }
+ 
++static void
++seq_print_qos(struct seq_file *s, const struct nf_conn *ct, int dir)
++{
++	struct nf_conn_qos *qos;
++
++	qos = nf_conn_qos_find(ct);
++	if (!qos)
++		return;
++
++	seq_printf(s, "tos=%u ", qos->tos[dir].value);
++}
++
+ /* return 0 on success, 1 in case of error */
+ static int ct_seq_show(struct seq_file *s, void *v)
+ {
+@@ -355,6 +368,8 @@ static int ct_seq_show(struct seq_file *
+ 
+ 	seq_print_acct(s, ct, IP_CT_DIR_ORIGINAL);
+ 
++	seq_print_qos(s, ct, IP_CT_DIR_ORIGINAL);
++
+ 	if (!(test_bit(IPS_SEEN_REPLY_BIT, &ct->status)))
+ 		seq_puts(s, "[UNREPLIED] ");
+ 
+@@ -364,6 +379,8 @@ static int ct_seq_show(struct seq_file *
+ 
+ 	seq_print_acct(s, ct, IP_CT_DIR_REPLY);
+ 
++	seq_print_qos(s, ct, IP_CT_DIR_REPLY);
++
+ 	if (test_bit(IPS_HW_OFFLOAD_BIT, &ct->status))
+ 		seq_puts(s, "[HW_OFFLOAD] ");
+ 	else if (test_bit(IPS_OFFLOAD_BIT, &ct->status))
+@@ -646,6 +663,7 @@ enum nf_ct_sysctl_index {
+ 	NF_SYSCTL_CT_LOG_INVALID,
+ 	NF_SYSCTL_CT_EXPECT_MAX,
+ 	NF_SYSCTL_CT_ACCT,
++	NF_SYSCTL_CT_QOS,
+ #ifdef CONFIG_NF_CONNTRACK_EVENTS
+ 	NF_SYSCTL_CT_EVENTS,
+ #endif
+@@ -752,6 +770,15 @@ static struct ctl_table nf_ct_sysctl_tab
+ 		.extra1 	= SYSCTL_ZERO,
+ 		.extra2 	= SYSCTL_ONE,
+ 	},
++	[NF_SYSCTL_CT_QOS] = {
++		.procname	= "nf_conntrack_qos",
++		.data		= &init_net.ct.sysctl_qos,
++		.maxlen		= sizeof(u8),
++		.mode		= 0644,
++		.proc_handler	= proc_dou8vec_minmax,
++		.extra1 	= SYSCTL_ZERO,
++		.extra2 	= SYSCTL_TWO_HUNDRED,
++	},
+ #ifdef CONFIG_NF_CONNTRACK_EVENTS
+ 	[NF_SYSCTL_CT_EVENTS] = {
+ 		.procname	= "nf_conntrack_events",
+--- a/net/netfilter/nf_flow_table_core.c
++++ b/net/netfilter/nf_flow_table_core.c
+@@ -9,6 +9,7 @@
+ #include <net/ip6_route.h>
+ #include <net/netfilter/nf_flow_table.h>
+ #include <net/netfilter/nf_conntrack.h>
++#include <net/netfilter/nf_conntrack_qos.h>
+ #include <net/netfilter/nf_conntrack_core.h>
+ #include <net/netfilter/nf_conntrack_l4proto.h>
+ #include <net/netfilter/nf_conntrack_tuple.h>
+@@ -383,12 +384,36 @@ static void flow_offload_del(struct nf_f
+ 
+ void flow_offload_teardown(struct flow_offload *flow)
+ {
++	nf_ct_qos_clear(flow->ct);
+ 	clear_bit(IPS_OFFLOAD_BIT, &flow->ct->status);
+ 	if (!test_and_set_bit(NF_FLOW_TEARDOWN, &flow->flags))
+ 		flow_offload_fixup_ct(flow);
+ }
+ EXPORT_SYMBOL_GPL(flow_offload_teardown);
+ 
++void flow_offload_teardown_by_tuple(struct flow_offload_tuple *tuple)
++{
++	struct net_device *netdev;
++	struct nf_flowtable *flowtable;
++	struct flow_offload_tuple_rhash *tuplehash;
++	struct flow_offload *flow;
++	int dir;
++
++	list_for_each_entry(flowtable, &flowtables, list) {
++		for_each_netdev(&init_net, netdev) {
++			tuple->iifidx = netdev->ifindex;
++			tuplehash = flow_offload_lookup(flowtable, tuple);
++			if (!tuplehash)
++				continue;
++
++			dir = tuplehash->tuple.dir;
++			flow = container_of(tuplehash, struct flow_offload, tuplehash[dir]);
++			flow_offload_teardown(flow);
++		}
++	};
++}
++EXPORT_SYMBOL_GPL(flow_offload_teardown_by_tuple);
++
+ struct flow_offload_tuple_rhash *
+ flow_offload_lookup(struct nf_flowtable *flow_table,
+ 		    struct flow_offload_tuple *tuple)
+--- a/net/netfilter/nf_flow_table_ip.c
++++ b/net/netfilter/nf_flow_table_ip.c
+@@ -385,6 +385,7 @@ static int nf_flow_offload_forward(struc
+ 	struct flow_offload *flow;
+ 	unsigned int thoff, mtu;
+ 	struct iphdr *iph;
++	struct net *net;
+ 
+ 	dir = tuplehash->tuple.dir;
+ 	flow = container_of(tuplehash, struct flow_offload, tuplehash[dir]);
+@@ -406,6 +407,10 @@ static int nf_flow_offload_forward(struc
+ 	if (skb_try_make_writable(skb, thoff + ctx->hdrsize))
+ 		return -1;
+ 
++	net = nf_ct_net(flow->ct);
++	if (net->ct.sysctl_qos)
++		ipv4_change_dsfield(iph, 0u, flow->tuplehash[dir].tuple.tos);
++
+ 	flow_offload_refresh(flow_table, flow, false);
+ 
+ 	nf_flow_encap_pop(skb, tuplehash);
+@@ -674,6 +679,7 @@ static int nf_flow_offload_ipv6_forward(
+ 	struct flow_offload *flow;
+ 	unsigned int thoff, mtu;
+ 	struct ipv6hdr *ip6h;
++	struct net *net;
+ 
+ 	dir = tuplehash->tuple.dir;
+ 	flow = container_of(tuplehash, struct flow_offload, tuplehash[dir]);
+@@ -695,6 +701,10 @@ static int nf_flow_offload_ipv6_forward(
+ 	if (skb_try_make_writable(skb, thoff + ctx->hdrsize))
+ 		return -1;
+ 
++	net = nf_ct_net(flow->ct);
++	if (net->ct.sysctl_qos)
++		ipv6_change_dsfield(ip6h, 0u, flow->tuplehash[dir].tuple.tos);
++
+ 	flow_offload_refresh(flow_table, flow, false);
+ 
+ 	nf_flow_encap_pop(skb, tuplehash);
+--- a/net/netfilter/nf_flow_table_offload.c
++++ b/net/netfilter/nf_flow_table_offload.c
+@@ -105,6 +105,7 @@ static int nf_flow_rule_match(struct nf_
+ 	NF_FLOW_DISSECTOR(match, FLOW_DISSECTOR_KEY_IPV6_ADDRS, ipv6);
+ 	NF_FLOW_DISSECTOR(match, FLOW_DISSECTOR_KEY_TCP, tcp);
+ 	NF_FLOW_DISSECTOR(match, FLOW_DISSECTOR_KEY_PORTS, tp);
++	NF_FLOW_DISSECTOR(match, FLOW_DISSECTOR_KEY_IP, ip);
+ 
+ 	if (other_dst && other_dst->lwtstate) {
+ 		tun_info = lwt_tun_info(other_dst->lwtstate);
+@@ -184,9 +185,13 @@ static int nf_flow_rule_match(struct nf_
+ 	key->basic.ip_proto = tuple->l4proto;
+ 	mask->basic.ip_proto = 0xff;
+ 
++	key->ip.tos = tuple->tos;
++	mask->ip.tos = 0xff;
++
+ 	match->dissector.used_keys |= BIT_ULL(FLOW_DISSECTOR_KEY_META) |
+ 				      BIT_ULL(FLOW_DISSECTOR_KEY_CONTROL) |
+-				      BIT_ULL(FLOW_DISSECTOR_KEY_BASIC);
++				      BIT_ULL(FLOW_DISSECTOR_KEY_BASIC) |
++				      BIT_ULL(FLOW_DISSECTOR_KEY_IP);
+ 
+ 	switch (tuple->l4proto) {
+ 	case IPPROTO_TCP:
+@@ -884,11 +889,13 @@ static int nf_flow_offload_alloc(const s
+ }
+ 
+ static void nf_flow_offload_init(struct flow_cls_offload *cls_flow,
++				 struct flow_offload *flow,
+ 				 __be16 proto, int priority,
+ 				 enum flow_cls_command cmd,
+ 				 const struct flow_offload_tuple *tuple,
+ 				 struct netlink_ext_ack *extack)
+ {
++	cls_flow->flow = flow;
+ 	cls_flow->common.protocol = proto;
+ 	cls_flow->common.prio = priority;
+ 	cls_flow->common.extack = extack;
+@@ -910,7 +917,7 @@ static int nf_flow_offload_tuple(struct
+ 	__be16 proto = ETH_P_ALL;
+ 	int err, i = 0;
+ 
+-	nf_flow_offload_init(&cls_flow, proto, priority, cmd,
++	nf_flow_offload_init(&cls_flow, flow, proto, priority, cmd,
+ 			     &flow->tuplehash[dir].tuple, &extack);
+ 	if (cmd == FLOW_CLS_REPLACE)
+ 		cls_flow.rule = flow_rule->rule;
+--- a/net/netfilter/nft_flow_offload.c
++++ b/net/netfilter/nft_flow_offload.c
+@@ -9,9 +9,11 @@
+ #include <linux/netfilter/nf_conntrack_common.h>
+ #include <linux/netfilter/nf_tables.h>
+ #include <net/ip.h>
++#include <net/dsfield.h>
+ #include <net/flow.h>
+ #include <net/netfilter/nf_tables.h>
+ #include <net/netfilter/nf_tables_core.h>
++#include <net/netfilter/nf_conntrack_qos.h>
+ #include <net/netfilter/nf_conntrack_core.h>
+ #include <net/netfilter/nf_conntrack_extend.h>
+ #include <net/netfilter/nf_flow_table.h>
+@@ -20,6 +22,19 @@ struct nft_flow_offload {
+ 	struct nft_flowtable	*flowtable;
+ };
+ 
++static void
++nft_flow_offload_dscp_init(struct flow_offload *flow, const struct nf_conn *ct,
++			   enum ip_conntrack_dir dir)
++{
++	struct nf_conn_qos *qos;
++
++	qos = nf_conn_qos_find(ct);
++	if (qos) {
++		flow->tuplehash[dir].tuple.tos = qos->tos[dir].value;
++		flow->tuplehash[!dir].tuple.tos = qos->tos[!dir].value;
++	}
++}
++
+ static bool nft_flow_offload_skip(struct sk_buff *skb, int family)
+ {
+ 	if (skb_sec_path(skb))
+@@ -58,6 +73,11 @@ static void nft_flow_offload_eval(const
+ 	struct flow_offload *flow;
+ 	enum ip_conntrack_dir dir;
+ 	struct nf_conn *ct;
++	struct nf_conn_qos *qos;
++	struct ipv6hdr *ip6h;
++	struct iphdr *iph;
++	u32 offset = 0;
++	u8 tos = 0;
+ 	int ret;
+ 
+ 	if (nft_flow_offload_skip(pkt->skb, nft_pf(pkt)))
+@@ -101,10 +121,33 @@ static void nft_flow_offload_eval(const
+ 	if (!nf_ct_is_confirmed(ct))
+ 		goto out;
+ 
++	dir = CTINFO2DIR(ctinfo);
++
++	qos = nf_conn_qos_find(ct);
++	if (qos) {
++		struct net *net = nf_ct_net(ct);
++
++		switch (nft_pf(pkt)) {
++		case NFPROTO_IPV4:
++			iph = (struct iphdr *)(skb_network_header(pkt->skb) + offset);
++			tos = iph->tos;
++			break;
++		case NFPROTO_IPV6:
++			ip6h = (struct ipv6hdr *)(skb_network_header(pkt->skb) + offset);
++			tos = ipv6_get_dsfield(ip6h);
++			break;
++		}
++
++		qos->tos[dir].value = tos;
++		atomic64_add(1, &qos->tos[dir].counter);
++
++		if (atomic64_read(&qos->tos[dir].counter) < net->ct.sysctl_qos)
++			goto out;
++	}
++
+ 	if (test_and_set_bit(IPS_OFFLOAD_BIT, &ct->status))
+ 		goto out;
+ 
+-	dir = CTINFO2DIR(ctinfo);
+ 	if (nft_flow_route(pkt, ct, &route, dir, priv->flowtable) < 0)
+ 		goto err_flow_route;
+ 
+@@ -116,6 +159,8 @@ static void nft_flow_offload_eval(const
+ 	if (tcph)
+ 		flow_offload_ct_tcp(ct);
+ 
++	nft_flow_offload_dscp_init(flow, ct, dir);
++
+ 	__set_bit(NF_FLOW_HW_BIDIRECTIONAL, &flow->flags);
+ 	ret = flow_offload_add(flowtable, flow);
+ 	if (ret < 0)
