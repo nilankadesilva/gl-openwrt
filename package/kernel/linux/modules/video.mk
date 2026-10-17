@@ -8,7 +8,7 @@
 
 VIDEO_MENU:=Video Support
 
-FBDEV_TARGETS:=@(TARGET_bcm27xx||TARGET_sunxi||TARGET_x86_legacy||TARGET_x86_geode)
+FBDEV_TARGETS:=@(TARGET_bcm27xx||TARGET_sunxi||TARGET_x86_legacy||TARGET_x86_geode||TARGET_mediatek)
 
 #
 # Media
@@ -481,8 +481,9 @@ $(eval $(call KernelPackage,drm-ttm-helper))
 define KernelPackage/drm-kms-helper
   SUBMENU:=$(VIDEO_MENU)
   TITLE:=CRTC helpers for KMS drivers
-  DEPENDS:=video-support +kmod-drm
-  KCONFIG:=CONFIG_DRM_KMS_HELPER
+  DEPENDS:=video-support +kmod-drm +kmod-fb +kmod-fb-sys-fops +kmod-fb-cfb-copyarea \
+	+kmod-fb-cfb-fillrect +kmod-fb-cfb-imgblt +kmod-fb-sys-ram
+  KCONFIG:=CONFIG_DRM_KMS_HELPER CONFIG_DRM_KMS_FB_HELPER=y
   FILES:=$(LINUX_DIR)/drivers/gpu/drm/drm_kms_helper.ko
   AUTOLOAD:=$(call AutoProbe,drm_kms_helper)
 endef
@@ -824,11 +825,28 @@ endef
 
 $(eval $(call KernelPackage,drm-imx-ldb))
 
+define KernelPackage/drm-client-lib
+  SUBMENU:=$(VIDEO_MENU)
+  TITLE:=DRM client library setup helper
+  DEPENDS:=video-support @LINUX_6_18 +kmod-drm +kmod-drm-kms-helper
+  KCONFIG:=CONFIG_DRM_CLIENT_LIB
+  FILES:= $(LINUX_DIR)/drivers/gpu/drm/clients/drm_client_lib.ko
+  AUTOLOAD:=$(call AutoProbe,drm_client_lib)
+endef
+
+define KernelPackage/drm-client-lib/description
+  DRM client library setup helper
+endef
+
+$(eval $(call KernelPackage,drm-client-lib))
+
 define KernelPackage/drm-panel-mipi-dbi
   SUBMENU:=$(VIDEO_MENU)
   TITLE:=Generic MIPI DBI LCD panel
-  DEPENDS:=+kmod-drm-mipi-dbi +kmod-drm-dma-helper
-  KCONFIG:=CONFIG_DRM_PANEL_MIPI_DBI
+  DEPENDS:=+kmod-drm-mipi-dbi +kmod-drm-dma-helper +kmod-drm-client-lib
+  KCONFIG:=CONFIG_DRM_PANEL_MIPI_DBI \
+	CONFIG_DRM_FBDEV_EMULATION=y \
+	CONFIG_DRM_FBDEV_OVERALLOC=100
   FILES:= \
 	$(LINUX_DIR)/drivers/gpu/drm/tiny/panel-mipi-dbi.ko
   AUTOLOAD:=$(call AutoProbe,panel-mipi-dbi,1)
