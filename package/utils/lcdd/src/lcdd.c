@@ -2,7 +2,8 @@
  * Reads a subset of Linux-console ANSI text from a FIFO, keeps an 8x8-font cell grid,
  * draws into one dumb buffer and flushes damage with DRM_IOCTL_MODE_DIRTYFB.
  * No libdrm; raw ioctls only. GPL-2.0 (font data from the Linux kernel, lib/fonts/font_8x8.c).
- * usage: lcdd [-d /dev/dri/card0] [-f /tmp/lcd.fifo] [-r 0|90|180|270]
+ * usage: lcdd [-d /dev/dri/card0] [-f /tmp/lcd.fifo] [-r 0|90|180|270] [-q quiet_ms] [-m max_ms]
+ * Flushes are coalesced: after input, wait up to quiet_ms for more before flushing, never longer than max_ms.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -16,12 +17,14 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <poll.h>
+#include <time.h>
 #include <drm/drm.h>
 #include <drm/drm_mode.h>
 #include <drm/drm_fourcc.h>
 #include "font8x8.h"
 
-static int drmfd, PW, PH, W, H, COLS, ROWS, ROT, BPP;
+static int drmfd, PW, PH, W, H, COLS, ROWS, ROT, BPP, QUIET_MS = 50, MAX_MS = 150;
 static uint32_t fb_id, pitch;
 static uint8_t *fbmem; static size_t fbsize;
 static int dx0, dy0, dx1, dy1, dirty;
@@ -30,6 +33,7 @@ static int cur_r, cur_c, bold, fg = 7, bg = 0;
 static const uint32_t pal[16] = { 0x000000,0xaa0000,0x00aa00,0xaa5500,0x0000aa,0xaa00aa,0x00aaaa,0xaaaaaa,
                                   0x555555,0xff5555,0x55ff55,0xffff55,0x5555ff,0xff55ff,0x55ffff,0xffffff };
 
+static long now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1000L + t.tv_nsec / 1000000; }
 static int xioctl(unsigned long req, void *arg) { int r; do r = ioctl(drmfd, req, arg); while (r == -1 && errno == EINTR); return r; }
 static void die(const char *m) { perror(m); exit(1); }
 
@@ -79,10 +83,12 @@ static void csi(int *p, int n, int priv, int final) {
     case 'J': { int m = n > 0 ? p[0] : 0;
         if (m == 2 || m == 3) erase(0, 0, ROWS - 1, COLS - 1);
         else if (m == 1) erase(0, 0, cur_r, cur_c < COLS ? cur_c : COLS - 1);
-        else erase(cur_r, cur_c < COLS ? cur_c : COLS - 1, ROWS - 1, COLS - 1); break; }
+        else erase(cur_r, cur_c < COLS ? cur_c : COLS - 1, ROWS - 1, COLS - 1);
+        break; }
     case 'K': { int m = n > 0 ? p[0] : 0;
         if (m == 2) erase(cur_r, 0, cur_r, COLS - 1); else if (m == 1) erase(cur_r, 0, cur_r, cur_c < COLS ? cur_c : COLS - 1);
-        else erase(cur_r, cur_c < COLS ? cur_c : COLS - 1, cur_r, COLS - 1); break; }
+        else erase(cur_r, cur_c < COLS ? cur_c : COLS - 1, cur_r, COLS - 1);
+        break; }
     case 'A': cur_r -= n > 0 && p[0] > 0 ? p[0] : 1; if (cur_r < 0) cur_r = 0; break;
     case 'B': cur_r += n > 0 && p[0] > 0 ? p[0] : 1; if (cur_r >= ROWS) cur_r = ROWS - 1; break;
     case 'C': cur_c += n > 0 && p[0] > 0 ? p[0] : 1; if (cur_c >= COLS) cur_c = COLS - 1; break;
@@ -172,7 +178,7 @@ static void setup_drm(const char *card) {
 
 int main(int argc, char **argv) {
     const char *card = "/dev/dri/card0", *fifo = "/tmp/lcd.fifo"; int o;
-    while ((o = getopt(argc, argv, "d:f:r:")) != -1) { if (o == 'd') card = optarg; else if (o == 'f') fifo = optarg; else if (o == 'r') ROT = atoi(optarg); else { fprintf(stderr, "usage: lcdd [-d card] [-f fifo] [-r 0|90|180|270]\n"); return 2; } }
+    while ((o = getopt(argc, argv, "d:f:r:q:m:")) != -1) { if (o == 'd') card = optarg; else if (o == 'f') fifo = optarg; else if (o == 'r') ROT = atoi(optarg); else if (o == 'q') QUIET_MS = atoi(optarg); else if (o == 'm') MAX_MS = atoi(optarg); else { fprintf(stderr, "usage: lcdd [-d card] [-f fifo] [-r 0|90|180|270] [-q quiet_ms] [-m max_ms]\n"); return 2; } }
     signal(SIGPIPE, SIG_IGN);
     setup_drm(card);
     if (ROT == 90 || ROT == 270) { W = PH; H = PW; } else { W = PW; H = PH; }
@@ -182,7 +188,21 @@ int main(int argc, char **argv) {
     erase(0, 0, ROWS - 1, COLS - 1); dirty = 1; dx0 = dy0 = 0; dx1 = PW - 1; dy1 = PH - 1; flush();
     if (mkfifo(fifo, 0622) && errno != EEXIST) die("mkfifo");
     int fd = open(fifo, O_RDWR); if (fd < 0) die("open fifo");   /* O_RDWR: never sees EOF between writers */
-    unsigned char buf[4096]; int n;
-    while ((n = read(fd, buf, sizeof buf)) != 0) { if (n < 0) { if (errno == EINTR) continue; die("read"); } process(buf, n); flush(); }
+    unsigned char buf[4096]; int n; long first = 0;
+    for (;;) {
+        /* coalesce: a redraw arrives as several writes; push one frame when the burst goes quiet, or at the cap */
+        int timeout = -1;
+        if (dirty) { long el = now_ms() - first; if (el >= MAX_MS) { flush(); timeout = -1; }
+                     else timeout = QUIET_MS < MAX_MS - el ? QUIET_MS : (int)(MAX_MS - el); }
+        struct pollfd pf = { .fd = fd, .events = POLLIN };
+        int r = poll(&pf, 1, timeout);
+        if (r < 0) { if (errno == EINTR) continue; die("poll"); }
+        if (r == 0) { flush(); continue; }
+        n = read(fd, buf, sizeof buf);
+        if (n < 0) { if (errno == EINTR) continue; die("read"); }
+        if (n == 0) break;
+        int was = dirty; process(buf, n);
+        if (dirty && !was) first = now_ms();
+    }
     return 0;
 }
