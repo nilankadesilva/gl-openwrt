@@ -2,8 +2,10 @@ From: Nilanka de Silva <nilankadsilva@gmail.com>
 Subject: net: mediatek: PPE HQoS subset of the MediaTek vendor series, ported to 6.18
 Adds mtk_eth_qos_debugfs.c: /sys/kernel/debug/mtketh/qdma_sch<N>, qdma_txq<N> (vendor-compatible formats) so the
 qos_toggle HQoS mode has a shaper/scheduler configuration interface without the SDK mtk_hnat driver.
---- a/drivers/net/ethernet/mediatek/Makefile
-+++ b/drivers/net/ethernet/mediatek/Makefile
+Index: linux-6.18.55/drivers/net/ethernet/mediatek/Makefile
+===================================================================
+--- linux-6.18.55.orig/drivers/net/ethernet/mediatek/Makefile
++++ linux-6.18.55/drivers/net/ethernet/mediatek/Makefile
 @@ -4,7 +4,7 @@
  #
  
@@ -13,8 +15,10 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  mtk_eth-$(CONFIG_NET_MEDIATEK_SOC_WED) += mtk_wed.o mtk_wed_mcu.o mtk_wed_wo.o
  ifdef CONFIG_DEBUG_FS
  mtk_eth-$(CONFIG_NET_MEDIATEK_SOC_WED) += mtk_wed_debugfs.o
+Index: linux-6.18.55/drivers/net/ethernet/mediatek/mtk_eth_qos_debugfs.c
+===================================================================
 --- /dev/null
-+++ b/drivers/net/ethernet/mediatek/mtk_eth_qos_debugfs.c
++++ linux-6.18.55/drivers/net/ethernet/mediatek/mtk_eth_qos_debugfs.c
 @@ -0,0 +1,283 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/* Minimal QDMA scheduler / per-queue shaper configuration for MediaTek NETSYS,
@@ -299,9 +303,11 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
 +	debugfs_remove_recursive(mtk_qos_root);
 +	mtk_qos_root = NULL;
 +}
---- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
-+++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
-@@ -5135,6 +5135,18 @@ static u16 mtk_select_queue(struct net_d
+Index: linux-6.18.55/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+===================================================================
+--- linux-6.18.55.orig/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ linux-6.18.55/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -5161,6 +5161,18 @@ static u16 mtk_select_queue(struct net_d
  		queue = mac->id;
  	}
  
@@ -320,8 +326,10 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  	if (queue >= dev->num_tx_queues)
  		queue = 0;
  
---- a/drivers/net/ethernet/mediatek/mtk_eth_soc.h
-+++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.h
+Index: linux-6.18.55/drivers/net/ethernet/mediatek/mtk_eth_soc.h
+===================================================================
+--- linux-6.18.55.orig/drivers/net/ethernet/mediatek/mtk_eth_soc.h
++++ linux-6.18.55/drivers/net/ethernet/mediatek/mtk_eth_soc.h
 @@ -34,6 +34,12 @@
  #define MTK_DSA_USER_PORT_MAX	32
  
@@ -449,9 +457,11 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  u32 mtk_m32(struct mtk_eth *eth, u32 mask, u32 set, unsigned int reg);
  
  int mtk_gmac_sgmii_path_setup(struct mtk_eth *eth, int mac_id);
---- a/drivers/net/ethernet/mediatek/mtk_ppe.c
-+++ b/drivers/net/ethernet/mediatek/mtk_ppe.c
-@@ -78,6 +78,21 @@ static int mtk_ppe_wait_busy(struct mtk_
+Index: linux-6.18.55/drivers/net/ethernet/mediatek/mtk_ppe.c
+===================================================================
+--- linux-6.18.55.orig/drivers/net/ethernet/mediatek/mtk_ppe.c
++++ linux-6.18.55/drivers/net/ethernet/mediatek/mtk_ppe.c
+@@ -80,6 +80,21 @@ static int mtk_ppe_wait_busy(struct mtk_
  	return ret;
  }
  
@@ -473,7 +483,7 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  static int mtk_ppe_mib_wait_busy(struct mtk_ppe *ppe)
  {
  	int ret;
-@@ -141,15 +156,147 @@ struct mtk_foe_accounting *mtk_ppe_mib_e
+@@ -143,15 +158,147 @@ struct mtk_foe_accounting *mtk_ppe_mib_e
  	return acct;
  }
  
@@ -622,7 +632,7 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  
  	ppe_m32(ppe, MTK_PPE_CACHE_CTL, MTK_PPE_CACHE_CTL_EN,
  		enable * MTK_PPE_CACHE_CTL_EN);
-@@ -223,6 +370,17 @@ mtk_foe_entry_ib2(struct mtk_eth *eth, s
+@@ -225,6 +372,17 @@ mtk_foe_entry_ib2(struct mtk_eth *eth, s
  	return &entry->ipv4.ib2;
  }
  
@@ -640,7 +650,7 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  int mtk_foe_entry_prepare(struct mtk_eth *eth, struct mtk_foe_entry *entry,
  			  int type, int l4proto, u8 pse_port, u8 *src_mac,
  			  u8 *dest_mac)
-@@ -255,9 +413,6 @@ int mtk_foe_entry_prepare(struct mtk_eth
+@@ -257,9 +415,6 @@ int mtk_foe_entry_prepare(struct mtk_eth
  		      FIELD_PREP(MTK_FOE_IB2_PORT_AG, 0x1f);
  	}
  
@@ -650,7 +660,7 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  	ports_pad = 0xa5a5a500 | (l4proto & 0xff);
  	if (type == MTK_PPE_PKT_TYPE_IPV4_ROUTE)
  		entry->ipv4.orig.ports = ports_pad;
-@@ -393,7 +548,24 @@ int mtk_foe_entry_set_dsa(struct mtk_eth
+@@ -395,7 +550,24 @@ int mtk_foe_entry_set_dsa(struct mtk_eth
  	else
  		l2->etype |= BIT(8);
  
@@ -676,7 +686,7 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  
  	return 0;
  }
-@@ -405,12 +577,12 @@ int mtk_foe_entry_set_vlan(struct mtk_et
+@@ -407,12 +579,12 @@ int mtk_foe_entry_set_vlan(struct mtk_et
  
  	switch (mtk_get_ib1_vlan_layer(eth, entry->ib1)) {
  	case 0:
@@ -692,7 +702,7 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  			l2->vlan1 = vid;
  			l2->etype |= BIT(8);
  		} else {
-@@ -428,8 +600,7 @@ int mtk_foe_entry_set_pppoe(struct mtk_e
+@@ -430,8 +602,7 @@ int mtk_foe_entry_set_pppoe(struct mtk_e
  {
  	struct mtk_foe_mac_info *l2 = mtk_foe_entry_l2(eth, entry);
  
@@ -702,7 +712,7 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  		l2->etype = ETH_P_PPP_SES;
  
  	entry->ib1 |= mtk_get_ib1_ppoe_mask(eth);
-@@ -497,11 +668,16 @@ int mtk_foe_entry_set_queue(struct mtk_e
+@@ -653,11 +824,16 @@ int mtk_foe_entry_set_queue(struct mtk_e
  		l2->tport |= FIELD_PREP(MTK_FOE_TPORT_IDX, 1);
  	}
  
@@ -721,7 +731,7 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  {
  	int type = mtk_get_ib1_pkt_type(eth, entry->ib1);
  
-@@ -511,9 +687,8 @@ mtk_flow_entry_match_len(struct mtk_eth
+@@ -667,9 +843,8 @@ mtk_flow_entry_match_len(struct mtk_eth
  		return offsetof(struct mtk_foe_entry, ipv4.ib2);
  }
  
@@ -733,30 +743,27 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  {
  	if ((data->ib1 ^ entry->data.ib1) & MTK_FOE_IB1_UDP)
  		return false;
-@@ -526,6 +701,7 @@ __mtk_foe_entry_clear(struct mtk_ppe *pp
- 		      bool set_state)
+@@ -681,15 +856,18 @@ static void
+ __mtk_foe_entry_unbind(struct mtk_ppe *ppe, struct mtk_flow_entry *entry)
  {
- 	struct hlist_node *tmp;
+ 	struct mtk_foe_entry *hwe;
 +	int state;
  
- 	if (entry->type == MTK_FLOW_TYPE_L2) {
- 		rhashtable_remove_fast(&ppe->l2_flows, &entry->l2_node,
-@@ -539,10 +715,13 @@ __mtk_foe_entry_clear(struct mtk_ppe *pp
- 	if (entry->hash != 0xffff && set_state) {
- 		struct mtk_foe_entry *hwe = mtk_foe_get_entry(ppe, entry->hash);
+ 	if (entry->hash == 0xffff)
+ 		return;
  
-+		state = FIELD_GET(MTK_FOE_IB1_STATE, hwe->ib1);
-+
- 		hwe->ib1 &= ~MTK_FOE_IB1_STATE;
- 		hwe->ib1 |= FIELD_PREP(MTK_FOE_IB1_STATE, MTK_FOE_STATE_INVALID);
- 		dma_wmb();
--		mtk_ppe_cache_clear(ppe);
-+		if (state == MTK_FOE_STATE_BIND)
-+			mtk_ppe_cache_clear(ppe);
- 	}
+ 	hwe = mtk_foe_get_entry(ppe, entry->hash);
++	state = FIELD_GET(MTK_FOE_IB1_STATE, hwe->ib1);
+ 	hwe->ib1 &= ~MTK_FOE_IB1_STATE;
+ 	hwe->ib1 |= FIELD_PREP(MTK_FOE_IB1_STATE, MTK_FOE_STATE_INVALID);
+ 	dma_wmb();
+-	mtk_ppe_cache_clear(ppe);
++	if (state == MTK_FOE_STATE_BIND)
++		mtk_ppe_cache_clear(ppe);
  	entry->hash = 0xffff;
+ }
  
-@@ -667,7 +846,12 @@ __mtk_foe_entry_commit(struct mtk_ppe *p
+@@ -893,7 +1071,12 @@ __mtk_foe_entry_commit(struct mtk_ppe *p
  	struct mtk_foe_entry *hwe;
  	u32 val;
  
@@ -769,7 +776,7 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  		entry->ib1 &= ~MTK_FOE_IB1_BIND_TIMESTAMP_V2;
  		entry->ib1 |= FIELD_PREP(MTK_FOE_IB1_BIND_TIMESTAMP_V2,
  					 timestamp);
-@@ -677,7 +861,6 @@ __mtk_foe_entry_commit(struct mtk_ppe *p
+@@ -903,7 +1086,6 @@ __mtk_foe_entry_commit(struct mtk_ppe *p
  					 timestamp);
  	}
  
@@ -777,7 +784,7 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  	memcpy(&hwe->data, &entry->data, eth->soc->foe_entry_size - sizeof(hwe->ib1));
  	wmb();
  	hwe->ib1 = entry->ib1;
-@@ -697,8 +880,6 @@ __mtk_foe_entry_commit(struct mtk_ppe *p
+@@ -923,8 +1105,6 @@ __mtk_foe_entry_commit(struct mtk_ppe *p
  		acct->packets = 0;
  		acct->bytes = 0;
  	}
@@ -786,7 +793,7 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  }
  
  void mtk_foe_entry_clear(struct mtk_ppe *ppe, struct mtk_flow_entry *entry)
-@@ -944,6 +1125,7 @@ struct mtk_ppe *mtk_ppe_init(struct mtk_
+@@ -1240,6 +1420,7 @@ struct mtk_ppe *mtk_ppe_init(struct mtk_
  	ppe->base = base;
  	ppe->eth = eth;
  	ppe->dev = dev;
@@ -794,7 +801,7 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  	ppe->version = eth->soc->offload_version;
  	ppe->accounting = accounting;
  
-@@ -980,6 +1162,8 @@ struct mtk_ppe *mtk_ppe_init(struct mtk_
+@@ -1276,6 +1457,8 @@ struct mtk_ppe *mtk_ppe_init(struct mtk_
  		ppe->acct_table = acct;
  	}
  
@@ -803,7 +810,7 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  	mtk_ppe_debugfs_init(ppe, index);
  
  	return ppe;
-@@ -1078,6 +1262,9 @@ void mtk_ppe_start(struct mtk_ppe *ppe)
+@@ -1374,6 +1557,9 @@ void mtk_ppe_start(struct mtk_ppe *ppe)
  			 MTK_PPE_ENTRIES_SHIFT);
  	if (mtk_is_netsys_v2_or_greater(ppe->eth))
  		val |= MTK_PPE_TB_CFG_INFO_SEL;
@@ -813,7 +820,7 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  	if (!mtk_is_netsys_v3_or_greater(ppe->eth))
  		val |= MTK_PPE_TB_CFG_ENTRY_80B;
  	ppe_w32(ppe, MTK_PPE_TB_CFG, val);
-@@ -1085,8 +1272,6 @@ void mtk_ppe_start(struct mtk_ppe *ppe)
+@@ -1381,8 +1567,6 @@ void mtk_ppe_start(struct mtk_ppe *ppe)
  	ppe_w32(ppe, MTK_PPE_IP_PROTO_CHK,
  		MTK_PPE_IP_PROTO_CHK_IPV4 | MTK_PPE_IP_PROTO_CHK_IPV6);
  
@@ -822,7 +829,7 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  	val = MTK_PPE_FLOW_CFG_IP6_3T_ROUTE |
  	      MTK_PPE_FLOW_CFG_IP6_5T_ROUTE |
  	      MTK_PPE_FLOW_CFG_IP6_6RD |
-@@ -1108,12 +1293,12 @@ void mtk_ppe_start(struct mtk_ppe *ppe)
+@@ -1404,12 +1588,12 @@ void mtk_ppe_start(struct mtk_ppe *ppe)
  	      FIELD_PREP(MTK_PPE_UNBIND_AGE_DELTA, 3);
  	ppe_w32(ppe, MTK_PPE_UNBIND_AGE, val);
  
@@ -837,7 +844,7 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  	ppe_w32(ppe, MTK_PPE_BIND_AGE1, val);
  
  	val = MTK_PPE_BIND_LIMIT0_QUARTER | MTK_PPE_BIND_LIMIT0_HALF;
-@@ -1132,8 +1317,14 @@ void mtk_ppe_start(struct mtk_ppe *ppe)
+@@ -1428,8 +1612,14 @@ void mtk_ppe_start(struct mtk_ppe *ppe)
  	      MTK_PPE_GLO_CFG_IP4_L4_CS_DROP |
  	      MTK_PPE_GLO_CFG_IP4_CS_DROP |
  	      MTK_PPE_GLO_CFG_FLOW_DROP_UPDATE;
@@ -852,7 +859,7 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  	ppe_w32(ppe, MTK_PPE_DEFAULT_CPU_PORT, 0);
  
  	if (mtk_is_netsys_v2_or_greater(ppe->eth)) {
-@@ -1148,7 +1339,7 @@ void mtk_ppe_start(struct mtk_ppe *ppe)
+@@ -1444,7 +1634,7 @@ void mtk_ppe_start(struct mtk_ppe *ppe)
  		ppe_m32(ppe, MTK_PPE_MIB_CFG, MTK_PPE_MIB_CFG_RD_CLR,
  			MTK_PPE_MIB_CFG_RD_CLR);
  		ppe_m32(ppe, MTK_PPE_MIB_CACHE_CTL, MTK_PPE_MIB_CACHE_CTL_EN,
@@ -861,17 +868,19 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  	}
  }
  
---- a/drivers/net/ethernet/mediatek/mtk_ppe.h
-+++ b/drivers/net/ethernet/mediatek/mtk_ppe.h
-@@ -8,6 +8,7 @@
- #include <linux/bitfield.h>
- #include <linux/rhashtable.h>
+Index: linux-6.18.55/drivers/net/ethernet/mediatek/mtk_ppe.h
+===================================================================
+--- linux-6.18.55.orig/drivers/net/ethernet/mediatek/mtk_ppe.h
++++ linux-6.18.55/drivers/net/ethernet/mediatek/mtk_ppe.h
+@@ -19,6 +19,7 @@ struct mtk_flow_match {
+ 	void *arg;
+ };
  
 +#define MTK_PPE_EXCEPTION_TAG		0x99
  #define MTK_PPE_ENTRIES_SHIFT		4
  #define MTK_PPE_ENTRIES			(1024 << MTK_PPE_ENTRIES_SHIFT)
  #define MTK_PPE_HASH_MASK		(MTK_PPE_ENTRIES - 1)
-@@ -34,6 +35,7 @@
+@@ -45,6 +46,7 @@ struct mtk_flow_match {
  
  /* CONFIG_MEDIATEK_NETSYS_V2 */
  #define MTK_FOE_IB1_BIND_TIMESTAMP_V2	GENMASK(7, 0)
@@ -879,7 +888,7 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  #define MTK_FOE_IB1_BIND_VLAN_LAYER_V2	GENMASK(16, 14)
  #define MTK_FOE_IB1_BIND_PPPOE_V2	BIT(17)
  #define MTK_FOE_IB1_BIND_VLAN_TAG_V2	BIT(18)
-@@ -41,6 +43,9 @@
+@@ -52,6 +54,9 @@ struct mtk_flow_match {
  #define MTK_FOE_IB1_BIND_TTL_V2		BIT(22)
  #define MTK_FOE_IB1_PACKET_TYPE_V2	GENMASK(27, 23)
  
@@ -889,7 +898,7 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  enum {
  	MTK_PPE_PKT_TYPE_IPV4_HNAPT = 0,
  	MTK_PPE_PKT_TYPE_IPV4_ROUTE = 1,
-@@ -96,6 +101,9 @@ enum {
+@@ -107,6 +112,9 @@ enum {
  #define MTK_FOE_WINFO_AMSDU_HF		BIT(23)
  #define MTK_FOE_WINFO_AMSDU_EN		BIT(24)
  
@@ -899,7 +908,7 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  #define MTK_FOE_TPORT_IDX		GENMASK(3, 0)
  
  enum {
-@@ -330,6 +338,7 @@ struct mtk_ppe {
+@@ -344,6 +352,7 @@ struct mtk_ppe {
  	struct mtk_eth *eth;
  	struct device *dev;
  	void __iomem *base;
@@ -907,7 +916,7 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  	int version;
  	char dirname[5];
  	bool accounting;
-@@ -346,6 +355,8 @@ struct mtk_ppe {
+@@ -360,6 +369,8 @@ struct mtk_ppe {
  	struct rhashtable l2_flows;
  
  	void *acct_table;
@@ -916,15 +925,7 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  };
  
  struct mtk_ppe *mtk_ppe_init(struct mtk_eth *eth, void __iomem *base, int index);
-@@ -358,7 +369,6 @@ int mtk_ppe_prepare_reset(struct mtk_ppe
- struct mtk_foe_accounting *mtk_ppe_mib_entry_read(struct mtk_ppe *ppe, u16 index);
- 
- void __mtk_ppe_check_skb(struct mtk_ppe *ppe, struct sk_buff *skb, u16 hash);
--
- static inline void
- mtk_ppe_check_skb(struct mtk_ppe *ppe, struct sk_buff *skb, u16 hash)
- {
-@@ -394,6 +404,8 @@ int mtk_foe_entry_set_ipv6_tuple(struct
+@@ -410,6 +421,8 @@ int mtk_foe_entry_set_ipv6_tuple(struct
  				 __be32 *dest_addr, __be16 dest_port);
  int mtk_foe_entry_set_dsa(struct mtk_eth *eth, struct mtk_foe_entry *entry,
  			  int port);
@@ -933,9 +934,9 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  int mtk_foe_entry_set_vlan(struct mtk_eth *eth, struct mtk_foe_entry *entry,
  			   int vid);
  int mtk_foe_entry_set_pppoe(struct mtk_eth *eth, struct mtk_foe_entry *entry,
-@@ -406,7 +418,11 @@ int mtk_foe_entry_set_queue(struct mtk_e
- int mtk_foe_entry_commit(struct mtk_ppe *ppe, struct mtk_flow_entry *entry);
- void mtk_foe_entry_clear(struct mtk_ppe *ppe, struct mtk_flow_entry *entry);
+@@ -426,7 +439,11 @@ void mtk_foe_entry_unbind(struct mtk_ppe
+ int mtk_foe_entry_flow_idle(struct mtk_ppe *ppe, struct mtk_flow_entry *entry,
+ 			    bool rx, const struct mtk_flow_match *match);
  int mtk_ppe_debugfs_init(struct mtk_ppe *ppe, int index);
 +int mtk_ppe_internal_debugfs_init(struct mtk_eth *eth);
  void mtk_foe_entry_get_stats(struct mtk_ppe *ppe, struct mtk_flow_entry *entry,
@@ -945,8 +946,10 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
 +			  struct mtk_foe_entry *data, int len);
  
  #endif
---- a/drivers/net/ethernet/mediatek/mtk_ppe_debugfs.c
-+++ b/drivers/net/ethernet/mediatek/mtk_ppe_debugfs.c
+Index: linux-6.18.55/drivers/net/ethernet/mediatek/mtk_ppe_debugfs.c
+===================================================================
+--- linux-6.18.55.orig/drivers/net/ethernet/mediatek/mtk_ppe_debugfs.c
++++ linux-6.18.55/drivers/net/ethernet/mediatek/mtk_ppe_debugfs.c
 @@ -126,6 +126,8 @@ mtk_ppe_debugfs_foe_show(struct seq_file
  			break;
  		}
@@ -1166,8 +1169,10 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
 +err:
 +	return ret;
 +}
---- a/drivers/net/ethernet/mediatek/mtk_ppe_offload.c
-+++ b/drivers/net/ethernet/mediatek/mtk_ppe_offload.c
+Index: linux-6.18.55/drivers/net/ethernet/mediatek/mtk_ppe_offload.c
+===================================================================
+--- linux-6.18.55.orig/drivers/net/ethernet/mediatek/mtk_ppe_offload.c
++++ linux-6.18.55/drivers/net/ethernet/mediatek/mtk_ppe_offload.c
 @@ -9,6 +9,9 @@
  #include <linux/ipv6.h>
  #include <net/flow_offload.h>
@@ -1178,7 +1183,7 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  #include <net/dsa.h>
  #include <linux/dsa/8021q.h>
  #include <linux/dsa/yt922x.h>
-@@ -229,16 +232,104 @@ mtk_flow_get_dsa_port(struct net_device
+@@ -234,16 +237,105 @@ mtk_flow_get_dsa_port(struct net_device
  }
  
  static int
@@ -1267,10 +1272,11 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
 +static int
  mtk_flow_set_output_device(struct mtk_eth *eth, struct mtk_foe_entry *foe,
 -			   struct net_device *dev, const u8 *dest_mac,
--			   int *wed_index, unsigned int num_vlans)
+-			   int *wed_index, u16 *wcid, unsigned int num_vlans)
 +			   struct net_device *idev, struct net_device *odev,
 +			   struct flow_cls_offload *f, const u8 *dest_mac,
-+			   int *wed_index, unsigned int num_vlans, int dscp)
++			   int *wed_index, u16 *wcid, unsigned int num_vlans,
++			   int dscp)
  {
 +	struct net_device *odev_conduit = odev;
  	struct mtk_wdma_info info = {};
@@ -1286,7 +1292,7 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  		mtk_foe_entry_set_wdma(eth, foe, info.wdma_idx, info.queue,
  				       info.bss, info.wcid, info.amsdu);
  		if (mtk_is_netsys_v2_or_greater(eth)) {
-@@ -262,13 +353,13 @@ mtk_flow_set_output_device(struct mtk_et
+@@ -268,13 +360,13 @@ mtk_flow_set_output_device(struct mtk_et
  		goto out;
  	}
  
@@ -1304,7 +1310,7 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  		pse_port = PSE_GDM3_PORT;
  	else
  		return -EOPNOTSUPP;
-@@ -289,15 +380,60 @@ mtk_flow_set_output_device(struct mtk_et
+@@ -295,15 +387,60 @@ mtk_flow_set_output_device(struct mtk_et
  	}
  
  	if (dsa_port >= 0 && dsa_port < MTK_DSA_USER_PORT_MAX) {
@@ -1368,15 +1374,15 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  
  	return 0;
  }
-@@ -335,6 +471,7 @@ mtk_flow_offload_replace(struct mtk_eth
- 	int wed_index = -1;
+@@ -342,6 +479,7 @@ mtk_flow_offload_replace(struct mtk_eth
  	u16 addr_type = 0;
+ 	u16 wcid = 0;
  	u8 l4proto = 0;
 +	u8 dscp = 0;
  	int err = 0;
  	int i;
  
-@@ -342,6 +479,9 @@ mtk_flow_offload_replace(struct mtk_eth
+@@ -349,6 +487,9 @@ mtk_flow_offload_replace(struct mtk_eth
  				   mtk_flow_ht_params))
  		return -EEXIST;
  
@@ -1386,7 +1392,7 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_META)) {
  		struct flow_match_meta match;
  
-@@ -394,6 +534,13 @@ mtk_flow_offload_replace(struct mtk_eth
+@@ -401,6 +542,13 @@ mtk_flow_offload_replace(struct mtk_eth
  		return -EOPNOTSUPP;
  	}
  
@@ -1400,19 +1406,19 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  	switch (addr_type) {
  	case 0:
  		offload_type = MTK_PPE_PKT_TYPE_BRIDGE;
-@@ -541,8 +688,9 @@ mtk_flow_offload_replace(struct mtk_eth
+@@ -549,8 +697,9 @@ mtk_flow_offload_replace(struct mtk_eth
  			return err;
  	}
  
 -	err = mtk_flow_set_output_device(eth, &foe, odev, data.eth.h_dest,
--					 &wed_index, data.vlan.num);
+-					 &wed_index, &wcid, data.vlan.num);
 +	err = mtk_flow_set_output_device(eth, &foe, idev, odev, f,
-+					 data.eth.h_dest, &wed_index, data.vlan.num,
-+					 dscp);
++					 data.eth.h_dest, &wed_index, &wcid,
++					 data.vlan.num, dscp);
  	if (err)
  		return err;
  
-@@ -738,7 +886,15 @@ int mtk_eth_setup_tc(struct net_device *
+@@ -838,7 +987,15 @@ int mtk_eth_setup_tc(struct net_device *
  
  int mtk_eth_offload_init(struct mtk_eth *eth, u8 id)
  {
@@ -1429,8 +1435,10 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
 +		mtk_ppe_internal_debugfs_init(eth);
 +	return err;
  }
---- a/drivers/net/ethernet/mediatek/mtk_ppe_regs.h
-+++ b/drivers/net/ethernet/mediatek/mtk_ppe_regs.h
+Index: linux-6.18.55/drivers/net/ethernet/mediatek/mtk_ppe_regs.h
+===================================================================
+--- linux-6.18.55.orig/drivers/net/ethernet/mediatek/mtk_ppe_regs.h
++++ linux-6.18.55/drivers/net/ethernet/mediatek/mtk_ppe_regs.h
 @@ -18,9 +18,12 @@
  #define MTK_PPE_GLO_CFG_UDP_LITE_EN		BIT(10)
  #define MTK_PPE_GLO_CFG_UDP_LEN_DROP		BIT(11)
@@ -1485,8 +1493,10 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
 +#define MTK_PPE_CACHE_DBG_BUSY			GENMASK(3, 0)
 +
  #endif
---- a/include/net/flow_offload.h
-+++ b/include/net/flow_offload.h
+Index: linux-6.18.55/include/net/flow_offload.h
+===================================================================
+--- linux-6.18.55.orig/include/net/flow_offload.h
++++ linux-6.18.55/include/net/flow_offload.h
 @@ -696,6 +696,7 @@ struct flow_cls_offload {
  	enum flow_cls_command command;
  	bool use_act_stats;
@@ -1495,8 +1505,10 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  	struct flow_rule *rule;
  	struct flow_stats stats;
  	u32 classid;
---- a/include/net/netfilter/nf_conntrack_extend.h
-+++ b/include/net/netfilter/nf_conntrack_extend.h
+Index: linux-6.18.55/include/net/netfilter/nf_conntrack_extend.h
+===================================================================
+--- linux-6.18.55.orig/include/net/netfilter/nf_conntrack_extend.h
++++ linux-6.18.55/include/net/netfilter/nf_conntrack_extend.h
 @@ -13,6 +13,7 @@ enum nf_ct_ext_id {
  #endif
  	NF_CT_EXT_SEQADJ,
@@ -1505,8 +1517,10 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  #ifdef CONFIG_NF_CONNTRACK_EVENTS
  	NF_CT_EXT_ECACHE,
  #endif
+Index: linux-6.18.55/include/net/netfilter/nf_conntrack_qos.h
+===================================================================
 --- /dev/null
-+++ b/include/net/netfilter/nf_conntrack_qos.h
++++ linux-6.18.55/include/net/netfilter/nf_conntrack_qos.h
 @@ -0,0 +1,64 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +/*
@@ -1572,8 +1586,10 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
 +void nf_conntrack_qos_pernet_init(struct net *net);
 +
 +#endif /* _NF_CONNTRACK_QOS_H */
---- a/include/net/netfilter/nf_flow_table.h
-+++ b/include/net/netfilter/nf_flow_table.h
+Index: linux-6.18.55/include/net/netfilter/nf_flow_table.h
+===================================================================
+--- linux-6.18.55.orig/include/net/netfilter/nf_flow_table.h
++++ linux-6.18.55/include/net/netfilter/nf_flow_table.h
 @@ -36,6 +36,7 @@ struct nf_flow_key {
  	};
  	struct flow_dissector_key_tcp			tcp;
@@ -1582,15 +1598,15 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  } __aligned(BITS_PER_LONG / 8); /* Ensure that we can do comparisons as longs. */
  
  struct nf_flow_match {
-@@ -137,6 +138,7 @@ struct flow_offload_tuple {
- 					xmit_type:3,
- 					encap_num:2,
+@@ -140,6 +141,7 @@ struct flow_offload_tuple {
+ 					bridge_vlan:1,
+ 					port_vlans:2,
  					in_vlan_ingress:2;
 +	u8				tos;
  	u16				mtu;
  	union {
  		struct {
-@@ -301,6 +303,7 @@ int nf_flow_table_init(struct nf_flowtab
+@@ -308,6 +310,7 @@ int nf_flow_table_init(struct nf_flowtab
  void nf_flow_table_free(struct nf_flowtable *flow_table);
  
  void flow_offload_teardown(struct flow_offload *flow);
@@ -1598,8 +1614,10 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  
  int nf_flow_table_iterate(struct nf_flowtable *flow_table,
                        void (*iter)(struct nf_flowtable *flowtable,
---- a/include/net/netns/conntrack.h
-+++ b/include/net/netns/conntrack.h
+Index: linux-6.18.55/include/net/netns/conntrack.h
+===================================================================
+--- linux-6.18.55.orig/include/net/netns/conntrack.h
++++ linux-6.18.55/include/net/netns/conntrack.h
 @@ -87,6 +87,7 @@ struct netns_ct {
  	u8			sysctl_log_invalid; /* Log invalid packets */
  	u8			sysctl_events;
@@ -1608,8 +1626,10 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  	u8			sysctl_tstamp;
  	u8			sysctl_checksum;
  
---- a/net/netfilter/Makefile
-+++ b/net/netfilter/Makefile
+Index: linux-6.18.55/net/netfilter/Makefile
+===================================================================
+--- linux-6.18.55.orig/net/netfilter/Makefile
++++ linux-6.18.55/net/netfilter/Makefile
 @@ -4,7 +4,7 @@ netfilter-objs := core.o nf_log.o nf_que
  nf_conntrack-y	:= nf_conntrack_core.o nf_conntrack_standalone.o nf_conntrack_expect.o nf_conntrack_helper.o \
  		   nf_conntrack_proto.o nf_conntrack_proto_generic.o nf_conntrack_proto_tcp.o nf_conntrack_proto_udp.o \
@@ -1619,8 +1639,10 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  
  nf_conntrack-$(subst m,y,$(CONFIG_IPV6)) += nf_conntrack_proto_icmpv6.o
  nf_conntrack-$(CONFIG_NF_CONNTRACK_TIMEOUT) += nf_conntrack_timeout.o
---- a/net/netfilter/nf_conntrack_core.c
-+++ b/net/netfilter/nf_conntrack_core.c
+Index: linux-6.18.55/net/netfilter/nf_conntrack_core.c
+===================================================================
+--- linux-6.18.55.orig/net/netfilter/nf_conntrack_core.c
++++ linux-6.18.55/net/netfilter/nf_conntrack_core.c
 @@ -41,6 +41,7 @@
  #include <net/netfilter/nf_conntrack_core.h>
  #include <net/netfilter/nf_conntrack_extend.h>
@@ -1629,7 +1651,7 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  #include <net/netfilter/nf_conntrack_ecache.h>
  #include <net/netfilter/nf_conntrack_zones.h>
  #include <net/netfilter/nf_conntrack_timestamp.h>
-@@ -1751,6 +1752,7 @@ init_conntrack(struct net *net, struct n
+@@ -1753,6 +1754,7 @@ init_conntrack(struct net *net, struct n
  				      GFP_ATOMIC);
  
  	nf_ct_acct_ext_add(ct, GFP_ATOMIC);
@@ -1637,7 +1659,7 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  	nf_ct_tstamp_ext_add(ct, GFP_ATOMIC);
  	nf_ct_labels_ext_add(ct);
  
-@@ -2716,6 +2718,7 @@ int nf_conntrack_init_net(struct net *ne
+@@ -2718,6 +2720,7 @@ int nf_conntrack_init_net(struct net *ne
  		goto err_expect;
  
  	nf_conntrack_acct_pernet_init(net);
@@ -1645,8 +1667,10 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  	nf_conntrack_tstamp_pernet_init(net);
  	nf_conntrack_ecache_pernet_init(net);
  	nf_conntrack_proto_pernet_init(net);
---- a/net/netfilter/nf_conntrack_extend.c
-+++ b/net/netfilter/nf_conntrack_extend.c
+Index: linux-6.18.55/net/netfilter/nf_conntrack_extend.c
+===================================================================
+--- linux-6.18.55.orig/net/netfilter/nf_conntrack_extend.c
++++ linux-6.18.55/net/netfilter/nf_conntrack_extend.c
 @@ -23,6 +23,7 @@
  #include <net/netfilter/nf_conntrack_labels.h>
  #include <net/netfilter/nf_conntrack_synproxy.h>
@@ -1663,8 +1687,10 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  #ifdef CONFIG_NF_CONNTRACK_EVENTS
  	[NF_CT_EXT_ECACHE] = sizeof(struct nf_conntrack_ecache),
  #endif
---- a/net/netfilter/nf_conntrack_netlink.c
-+++ b/net/netfilter/nf_conntrack_netlink.c
+Index: linux-6.18.55/net/netfilter/nf_conntrack_netlink.c
+===================================================================
+--- linux-6.18.55.orig/net/netfilter/nf_conntrack_netlink.c
++++ linux-6.18.55/net/netfilter/nf_conntrack_netlink.c
 @@ -42,6 +42,7 @@
  #include <net/netfilter/nf_conntrack_l4proto.h>
  #include <net/netfilter/nf_conntrack_tuple.h>
@@ -1673,7 +1699,7 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  #include <net/netfilter/nf_conntrack_zones.h>
  #include <net/netfilter/nf_conntrack_timestamp.h>
  #include <net/netfilter/nf_conntrack_labels.h>
-@@ -2304,6 +2305,7 @@ ctnetlink_create_conntrack(struct net *n
+@@ -2306,6 +2307,7 @@ ctnetlink_create_conntrack(struct net *n
  		goto err2;
  
  	nf_ct_acct_ext_add(ct, GFP_ATOMIC);
@@ -1681,8 +1707,10 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  	nf_ct_tstamp_ext_add(ct, GFP_ATOMIC);
  	nf_ct_ecache_ext_add(ct, 0, 0, GFP_ATOMIC);
  	nf_ct_labels_ext_add(ct);
+Index: linux-6.18.55/net/netfilter/nf_conntrack_qos.c
+===================================================================
 --- /dev/null
-+++ b/net/netfilter/nf_conntrack_qos.c
++++ linux-6.18.55/net/netfilter/nf_conntrack_qos.c
 @@ -0,0 +1,29 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
@@ -1713,8 +1741,10 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
 +	net->ct.sysctl_qos = nf_ct_qos;
 +}
 +
---- a/net/netfilter/nf_conntrack_standalone.c
-+++ b/net/netfilter/nf_conntrack_standalone.c
+Index: linux-6.18.55/net/netfilter/nf_conntrack_standalone.c
+===================================================================
+--- linux-6.18.55.orig/net/netfilter/nf_conntrack_standalone.c
++++ linux-6.18.55/net/netfilter/nf_conntrack_standalone.c
 @@ -22,6 +22,7 @@
  #include <net/netfilter/nf_conntrack_expect.h>
  #include <net/netfilter/nf_conntrack_helper.h>
@@ -1784,9 +1814,11 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  #ifdef CONFIG_NF_CONNTRACK_EVENTS
  	[NF_SYSCTL_CT_EVENTS] = {
  		.procname	= "nf_conntrack_events",
---- a/net/netfilter/nf_flow_table_core.c
-+++ b/net/netfilter/nf_flow_table_core.c
-@@ -9,6 +9,7 @@
+Index: linux-6.18.55/net/netfilter/nf_flow_table_core.c
+===================================================================
+--- linux-6.18.55.orig/net/netfilter/nf_flow_table_core.c
++++ linux-6.18.55/net/netfilter/nf_flow_table_core.c
+@@ -10,6 +10,7 @@
  #include <net/ip6_route.h>
  #include <net/netfilter/nf_flow_table.h>
  #include <net/netfilter/nf_conntrack.h>
@@ -1794,7 +1826,7 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  #include <net/netfilter/nf_conntrack_core.h>
  #include <net/netfilter/nf_conntrack_l4proto.h>
  #include <net/netfilter/nf_conntrack_tuple.h>
-@@ -383,12 +384,36 @@ static void flow_offload_del(struct nf_f
+@@ -394,12 +395,36 @@ static void flow_offload_del(struct nf_f
  
  void flow_offload_teardown(struct flow_offload *flow)
  {
@@ -1831,8 +1863,10 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  struct flow_offload_tuple_rhash *
  flow_offload_lookup(struct nf_flowtable *flow_table,
  		    struct flow_offload_tuple *tuple)
---- a/net/netfilter/nf_flow_table_ip.c
-+++ b/net/netfilter/nf_flow_table_ip.c
+Index: linux-6.18.55/net/netfilter/nf_flow_table_ip.c
+===================================================================
+--- linux-6.18.55.orig/net/netfilter/nf_flow_table_ip.c
++++ linux-6.18.55/net/netfilter/nf_flow_table_ip.c
 @@ -385,6 +385,7 @@ static int nf_flow_offload_forward(struc
  	struct flow_offload *flow;
  	unsigned int thoff, mtu;
@@ -1852,7 +1886,7 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  	flow_offload_refresh(flow_table, flow, false);
  
  	nf_flow_encap_pop(skb, tuplehash);
-@@ -674,6 +679,7 @@ static int nf_flow_offload_ipv6_forward(
+@@ -680,6 +685,7 @@ static int nf_flow_offload_ipv6_forward(
  	struct flow_offload *flow;
  	unsigned int thoff, mtu;
  	struct ipv6hdr *ip6h;
@@ -1860,7 +1894,7 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  
  	dir = tuplehash->tuple.dir;
  	flow = container_of(tuplehash, struct flow_offload, tuplehash[dir]);
-@@ -695,6 +701,10 @@ static int nf_flow_offload_ipv6_forward(
+@@ -701,6 +707,10 @@ static int nf_flow_offload_ipv6_forward(
  	if (skb_try_make_writable(skb, thoff + ctx->hdrsize))
  		return -1;
  
@@ -1871,8 +1905,10 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  	flow_offload_refresh(flow_table, flow, false);
  
  	nf_flow_encap_pop(skb, tuplehash);
---- a/net/netfilter/nf_flow_table_offload.c
-+++ b/net/netfilter/nf_flow_table_offload.c
+Index: linux-6.18.55/net/netfilter/nf_flow_table_offload.c
+===================================================================
+--- linux-6.18.55.orig/net/netfilter/nf_flow_table_offload.c
++++ linux-6.18.55/net/netfilter/nf_flow_table_offload.c
 @@ -105,6 +105,7 @@ static int nf_flow_rule_match(struct nf_
  	NF_FLOW_DISSECTOR(match, FLOW_DISSECTOR_KEY_IPV6_ADDRS, ipv6);
  	NF_FLOW_DISSECTOR(match, FLOW_DISSECTOR_KEY_TCP, tcp);
@@ -1881,7 +1917,7 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  
  	if (other_dst && other_dst->lwtstate) {
  		tun_info = lwt_tun_info(other_dst->lwtstate);
-@@ -184,9 +185,13 @@ static int nf_flow_rule_match(struct nf_
+@@ -189,9 +190,13 @@ static int nf_flow_rule_match(struct nf_
  	key->basic.ip_proto = tuple->l4proto;
  	mask->basic.ip_proto = 0xff;
  
@@ -1896,7 +1932,7 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  
  	switch (tuple->l4proto) {
  	case IPPROTO_TCP:
-@@ -884,11 +889,13 @@ static int nf_flow_offload_alloc(const s
+@@ -900,11 +905,13 @@ static int nf_flow_offload_alloc(const s
  }
  
  static void nf_flow_offload_init(struct flow_cls_offload *cls_flow,
@@ -1910,7 +1946,7 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  	cls_flow->common.protocol = proto;
  	cls_flow->common.prio = priority;
  	cls_flow->common.extack = extack;
-@@ -910,7 +917,7 @@ static int nf_flow_offload_tuple(struct
+@@ -926,7 +933,7 @@ static int nf_flow_offload_tuple(struct
  	__be16 proto = ETH_P_ALL;
  	int err, i = 0;
  
@@ -1919,8 +1955,10 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  			     &flow->tuplehash[dir].tuple, &extack);
  	if (cmd == FLOW_CLS_REPLACE)
  		cls_flow.rule = flow_rule->rule;
---- a/net/netfilter/nft_flow_offload.c
-+++ b/net/netfilter/nft_flow_offload.c
+Index: linux-6.18.55/net/netfilter/nft_flow_offload.c
+===================================================================
+--- linux-6.18.55.orig/net/netfilter/nft_flow_offload.c
++++ linux-6.18.55/net/netfilter/nft_flow_offload.c
 @@ -9,9 +9,11 @@
  #include <linux/netfilter/nf_conntrack_common.h>
  #include <linux/netfilter/nf_tables.h>
@@ -1953,7 +1991,7 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  static bool nft_flow_offload_skip(struct sk_buff *skb, int family)
  {
  	if (skb_sec_path(skb))
-@@ -58,6 +73,11 @@ static void nft_flow_offload_eval(const
+@@ -75,6 +90,11 @@ static void nft_flow_offload_eval(const
  	struct flow_offload *flow;
  	enum ip_conntrack_dir dir;
  	struct nf_conn *ct;
@@ -1965,7 +2003,7 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  	int ret;
  
  	if (nft_flow_offload_skip(pkt->skb, nft_pf(pkt)))
-@@ -101,10 +121,33 @@ static void nft_flow_offload_eval(const
+@@ -118,10 +138,33 @@ static void nft_flow_offload_eval(const
  	if (!nf_ct_is_confirmed(ct))
  		goto out;
  
@@ -2000,9 +2038,9 @@ qos_toggle HQoS mode has a shaper/scheduler configuration interface without the 
  	if (nft_flow_route(pkt, ct, &route, dir, priv->flowtable) < 0)
  		goto err_flow_route;
  
-@@ -116,6 +159,8 @@ static void nft_flow_offload_eval(const
- 	if (tcph)
- 		flow_offload_ct_tcp(ct);
+@@ -135,6 +178,8 @@ static void nft_flow_offload_eval(const
+ 
+ 	flow->priority = nft_flow_offload_priority(pkt);
  
 +	nft_flow_offload_dscp_init(flow, ct, dir);
 +
