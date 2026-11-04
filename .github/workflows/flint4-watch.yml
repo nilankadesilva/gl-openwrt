@@ -27,13 +27,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          T="flint4 watch: upstream changes since the last image"
-          n=$(gh issue list --state open --search "in:title \"$T\"" --json number,title --jq '[.[] | select(.title == "'"$T"'")][0].number')
+          # REST only (the GraphQL path used by gh issue create/list is not available to the job token here)
+          n=$(gh api "repos/$GITHUB_REPOSITORY/issues?labels=flint4-watch&state=open&per_page=1" --jq '.[0].number // empty')
           if [ -z "$n" ]; then
-            gh label create flint4-watch --color 0e8a16 --description "daily upstream watch" >/dev/null 2>&1 || true
-            if gh label list --json name --jq '.[].name' | grep -qx flint4-watch; then url=$(gh issue create --title "$T" --label flint4-watch --body "Daily report lands here as comments."); else url=$(gh issue create --title "$T" --body "Daily report lands here as comments."); fi
-            n=${url##*/}
+            n=$(gh api -X POST "repos/$GITHUB_REPOSITORY/issues" -f title="flint4 watch: upstream changes since the last image" -f body="Daily report from the flint4 watch workflow lands here as comments." -f 'labels[]=flint4-watch' --jq .number)
           fi
-          gh issue comment "$n" --body-file report.md
-          echo "posted to issue #$n"
+          gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$n/comments" -F body=@report.md --jq .html_url
           grep -qiE '^- .*(CVE|security|vuln)' report.md && echo "::warning::security-flagged upstream commits since the last image" || true
