@@ -3,6 +3,11 @@ on:
   schedule:
     - cron: '17 6 * * *'
   workflow_dispatch:
+    inputs:
+      test_alert:
+        description: force the security alert path (test)
+        type: boolean
+        default: false
 permissions:
   contents: read
   issues: write
@@ -34,3 +39,23 @@ jobs:
           fi
           gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$n/comments" -F body=@report.md --jq .html_url
           grep -qiE '^- .*(CVE|security|vuln)' report.md && echo "::warning::security-flagged upstream commits since the last image" || true
+      - name: security alert (mention = email/push notification)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TEST: ${{ inputs.test_alert }}
+        run: |
+          flagged=$(grep -iE '^- .*(CVE|security|vuln)' report.md || true)
+          [ "$TEST" = "true" ] && flagged="- 0000000000 $(date -u +%F) TEST: security alert path check (ignore)"
+          A=$(gh api "repos/$GITHUB_REPOSITORY/issues?labels=flint4-security&state=open&per_page=1" --jq '.[0].number // empty')
+          if [ -n "$flagged" ]; then
+            body=$(printf '@%s security-flagged upstream commits since image %s:\n\n%s\n\nRun: %s/%s/actions/runs/%s' "$GITHUB_REPOSITORY_OWNER" "$(git tag -l 'r[0-9]*' --sort=-v:refname | head -1)" "$flagged" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")
+            if [ -z "$A" ]; then
+              gh api "repos/$GITHUB_REPOSITORY/labels/flint4-security" >/dev/null 2>&1 || gh api -X POST "repos/$GITHUB_REPOSITORY/labels" -f name=flint4-security -f color=b60205 -f description="security-flagged upstream commits, image rebuild advised" >/dev/null
+              A=$(gh api -X POST "repos/$GITHUB_REPOSITORY/issues" -f title="flint4: security-flagged upstream commits, rebuild advised" -f body="$body" -f 'labels[]=flint4-security' --jq .number); echo "opened security issue #$A"
+            else
+              gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$A/comments" -f body="$body" >/dev/null; echo "updated security issue #$A"
+            fi
+          elif [ -n "$A" ]; then
+            gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$A/comments" -f body="Clear: the last image tag now covers the flagged commits. Closing." >/dev/null
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/$A" -f state=closed >/dev/null; echo "closed security issue #$A"
+          else echo "no security flags, no open alert"; fi
