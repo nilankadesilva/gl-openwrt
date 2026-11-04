@@ -1,0 +1,38 @@
+name: flint4 watch
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+  issues: write
+concurrency: flint4-watch
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: flint4-main
+          fetch-depth: 300
+          fetch-tags: true
+      - name: fetch upstream main
+        run: |
+          git remote add upstream https://github.com/openwrt/openwrt.git
+          git fetch -q --depth=3000 upstream main
+          git merge-base HEAD upstream/main >/dev/null || { git fetch -q --deepen=5000 upstream main; git fetch -q --deepen=2000 origin flint4-main; }
+      - name: report
+        run: bash .flint4/watch.sh && cat report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: post to the tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          n=$(gh issue list --label flint4-watch --state open --json number --jq '.[0].number')
+          if [ -z "$n" ]; then
+            gh label create flint4-watch --color 0e8a16 --description "daily upstream watch" 2>/dev/null || true
+            url=$(gh issue create --title "flint4 watch: upstream changes since the last image" --label flint4-watch --body "Daily report lands here as comments.")
+            n=${url##*/}
+          fi
+          gh issue comment "$n" --body-file report.md
+          echo "posted to issue #$n"
+          grep -qiE '^- .*(CVE|security|vuln)' report.md && echo "::warning::security-flagged upstream commits since the last image" || true

@@ -1,0 +1,44 @@
+name: flint4 prepare branch
+on:
+  workflow_dispatch:
+    inputs:
+      n:
+        description: image number N (creates branch flint4-main-rN)
+        required: true
+      base:
+        description: upstream ref to rebase onto
+        default: main
+permissions:
+  contents: write
+concurrency: flint4-prepare
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: flint4-main
+          fetch-depth: 300
+          fetch-tags: true
+      - name: rebase the stack onto upstream
+        env:
+          N: ${{ inputs.n }}
+          BASE: ${{ inputs.base }}
+        run: |
+          set -u
+          git config user.name "Nilanka de Silva"; git config user.email "nilankadsilva@gmail.com"
+          git remote add upstream https://github.com/openwrt/openwrt.git
+          git fetch -q --depth=3000 upstream "$BASE"
+          git merge-base HEAD upstream/$BASE >/dev/null || { git fetch -q --deepen=5000 upstream "$BASE"; git fetch -q --deepen=2000 origin flint4-main; }
+          MB=$(git merge-base HEAD upstream/$BASE); STACK=$(git rev-list --reverse $MB..HEAD)
+          echo "## flint4 prepare r$N" >> "$GITHUB_STEP_SUMMARY"
+          echo "base upstream/$BASE = $(git rev-parse --short upstream/$BASE) ($(git log -1 --format=%cd --date=short upstream/$BASE)); stack $(echo "$STACK" | wc -l) commits from $(git rev-parse --short $MB)" | tee -a "$GITHUB_STEP_SUMMARY"
+          git checkout -q -B flint4-main-r$N upstream/$BASE
+          ok=0; for c in $STACK; do s=$(git log -1 --format=%s $c)
+            if git cherry-pick $c >/dev/null 2>&1; then ok=$((ok+1)); echo "- picked $s" >> "$GITHUB_STEP_SUMMARY"
+            elif [ -z "$(git diff --name-only --diff-filter=U)" ] && git diff --cached --quiet; then git cherry-pick --skip >/dev/null 2>&1 || git reset -q --hard; echo "- skipped (already upstream): $s" >> "$GITHUB_STEP_SUMMARY"
+            else echo "- **CONFLICT**: $s -> $(git diff --name-only --diff-filter=U | tr '\n' ' ')" >> "$GITHUB_STEP_SUMMARY"; git cherry-pick --abort; echo "::error::cherry-pick conflict at: $s"; exit 1; fi
+          done
+          echo "- result: $ok picked; branch flint4-main-r$N = $(git rev-parse --short HEAD), $(git rev-list --count upstream/$BASE..HEAD) above upstream" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"; echo "Next, locally: \`/src/flint4-rebuild.sh $N --base mine/flint4-main-r$N\` (kernel patch check + build), then \`flint4-stage.sh $N\`." >> "$GITHUB_STEP_SUMMARY"
+          git push -q --force origin flint4-main-r$N
