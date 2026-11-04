@@ -27,10 +27,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          n=$(gh issue list --label flint4-watch --state open --json number --jq '.[0].number')
+          T="flint4 watch: upstream changes since the last image"
+          n=$(gh issue list --state open --search "in:title \"$T\"" --json number,title --jq '[.[] | select(.title == "'"$T"'")][0].number')
           if [ -z "$n" ]; then
-            gh label create flint4-watch --color 0e8a16 --description "daily upstream watch" 2>/dev/null || true
-            url=$(gh issue create --title "flint4 watch: upstream changes since the last image" --label flint4-watch --body "Daily report lands here as comments.")
+            gh label create flint4-watch --color 0e8a16 --description "daily upstream watch" >/dev/null 2>&1 || true
+            if gh label list --json name --jq '.[].name' | grep -qx flint4-watch; then url=$(gh issue create --title "$T" --label flint4-watch --body "Daily report lands here as comments."); else url=$(gh issue create --title "$T" --body "Daily report lands here as comments."); fi
             n=${url##*/}
           fi
           gh issue comment "$n" --body-file report.md
