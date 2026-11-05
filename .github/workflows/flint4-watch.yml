@@ -38,13 +38,13 @@ jobs:
             n=$(gh api -X POST "repos/$GITHUB_REPOSITORY/issues" -f title="flint4 watch: upstream changes since the last image" -f body="Daily report from the flint4 watch workflow lands here as comments." -f 'labels[]=flint4-watch' --jq .number)
           fi
           gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$n/comments" -F body=@report.md --jq .html_url
-          grep -qiE '^- .*(CVE|security|vuln)' report.md && echo "::warning::security-flagged upstream commits since the last image" || true
+          sed -n '/^### security-flagged/,/^### /p' report.md | grep -qE '^- ' && echo "::warning::security-flagged upstream commits since the last image" || true
       - name: security alert (mention = email/push notification)
         env:
           GH_TOKEN: ${{ github.token }}
           TEST: ${{ inputs.test_alert }}
         run: |
-          flagged=$(grep -iE '^- .*(CVE|security|vuln)' report.md || true)
+          flagged=$(sed -n '/^### security-flagged/,/^### /p' report.md | grep -E '^- ' || true)
           [ "$TEST" = "true" ] && flagged="- 0000000000 $(date -u +%F) TEST: security alert path check (ignore)"
           A=$(gh api "repos/$GITHUB_REPOSITORY/issues?labels=flint4-security&state=open&per_page=1" --jq '.[0].number // empty')
           if [ -n "$flagged" ]; then
